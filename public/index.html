@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Music Aggregator → TIDAL</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">Music Aggregator <span class="arrow">→</span> TIDAL</div>
+      <div id="account" class="account"></div>
+    </header>
+
+    <main>
+      <div id="flash" class="flash" hidden></div>
+
+      <!-- 1. Login -->
+      <section id="step-login" class="card" hidden>
+        <h1>Move your music library to TIDAL</h1>
+        <p>
+          Upload an export from YouTube Music (more services coming), review the matches, and we'll create the
+          playlists and favourites in your TIDAL account.
+        </p>
+        <a class="button primary" href="/auth/login">Log in with TIDAL</a>
+        <p class="muted small">You sign in on tidal.com; this app never sees your password.</p>
+      </section>
+
+      <!-- 2. Upload -->
+      <section id="step-upload" class="card" hidden>
+        <h2><span class="num">1</span> Upload your export</h2>
+        <label id="dropzone" class="dropzone">
+          <input id="file" type="file" accept=".zip,.csv,.tsv,.txt,application/zip,text/csv" />
+          <strong>Drop a .zip export or a .csv here</strong>
+          <span class="muted">or click to choose a file</span>
+        </label>
+        <details class="formats">
+          <summary>Supported formats</summary>
+          <ul id="formats"></ul>
+        </details>
+      </section>
+
+      <!-- 3. Choose collections -->
+      <section id="step-select" class="card" hidden>
+        <h2><span class="num">2</span> Choose what to import</h2>
+        <p id="detected" class="muted"></p>
+        <ul id="warnings" class="warnings"></ul>
+        <table class="select-table">
+          <thead>
+            <tr><th></th><th>Name on TIDAL</th><th>Type</th><th class="num-col">Tracks</th></tr>
+          </thead>
+          <tbody id="collections"></tbody>
+        </table>
+        <div class="actions">
+          <button id="btn-reupload" class="button">Upload a different file</button>
+          <button id="btn-match" class="button primary">Find these on TIDAL</button>
+        </div>
+      </section>
+
+      <!-- Progress (shared by match + import) -->
+      <section id="step-progress" class="card" hidden>
+        <h2 id="progress-title">Working…</h2>
+        <p id="progress-phase" class="muted"></p>
+        <div class="bar"><div id="progress-bar"></div></div>
+        <p id="progress-count" class="muted small"></p>
+      </section>
+
+      <!-- 4. Review -->
+      <section id="step-review" class="card" hidden>
+        <h2><span class="num">3</span> Review matches</h2>
+        <div id="stats" class="stats"></div>
+        <p class="muted small">
+          Confident matches are selected automatically. Pick a match for “needs review” tracks you want to keep.
+          Choices apply to every playlist the song appears in.
+        </p>
+        <div class="filters" role="tablist">
+          <button class="chip active" data-filter="all">All</button>
+          <button class="chip" data-filter="review">Needs review</button>
+          <button class="chip" data-filter="not_found">Not found</button>
+          <button class="chip" data-filter="matched">Matched</button>
+          <button id="btn-accept-review" class="chip">Accept all “needs review” suggestions</button>
+        </div>
+        <div id="review-collections"></div>
+        <div class="actions sticky">
+          <span id="import-summary" class="muted"></span>
+          <button id="btn-import" class="button primary">Import to TIDAL</button>
+        </div>
+      </section>
+
+      <!-- 5. Done -->
+      <section id="step-done" class="card" hidden>
+        <h2>Done</h2>
+        <ul id="done-list" class="done-list"></ul>
+        <button id="btn-again" class="button">Import another export</button>
+      </section>
+    </main>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

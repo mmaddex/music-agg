@@ -1,0 +1,25 @@
+{
+  "name": "music-agg",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Import music library exports (YouTube Music, and more later) into TIDAL.",
+  "type": "module",
+  "main": "src/server.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "test": "node --test \"test/**/*.test.js\"",
+    "inspect-export": "node scripts/inspect-export.js"
+  },
+  "dependencies": {
+    "csv-parse": "^7.0.3",
+    "express": "^5.1.0",
+    "express-session": "^1.18.2",
+    "memorystore": "^1.6.7",
+    "multer": "^2.0.2",
+    "yauzl": "^3.4.0"
+  }
+}

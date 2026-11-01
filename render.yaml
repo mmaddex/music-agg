@@ -1,0 +1,24 @@
+# Render Blueprint: https://render.com/docs/blueprint-spec
+# Deploy: Render Dashboard → New → Blueprint → pick this repo.
+services:
+  - type: web
+    name: music-agg
+    runtime: node
+    plan: starter # in-memory sessions/jobs: keep a single, always-on instance
+    buildCommand: npm ci --omit=dev
+    startCommand: npm start
+    healthCheckPath: /healthz
+    autoDeploy: true
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: NODE_ENV
+        value: production
+      - key: TIDAL_CLIENT_ID
+        sync: false # set in the dashboard (from developer.tidal.com → your app)
+      - key: SESSION_SECRET
+        generateValue: true
+      # Optional. Defaults to $RENDER_EXTERNAL_URL/auth/callback, which Render sets automatically.
+      # Set this if you use a custom domain; it must match a redirect URI registered with TIDAL.
+      - key: TIDAL_REDIRECT_URI
+        sync: false
