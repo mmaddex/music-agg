@@ -60,9 +60,14 @@ export class TidalClient {
     return u.toString();
   }
 
-  async request(method, path, { query, body } = {}) {
+  /**
+   * @param {string} [opts.idempotencyKey]  for writes; pass a deterministic key when the same
+   *        logical write may be re-sent by a later process (workflow retries). TIDAL replays the
+   *        original response for an identical request with the same key within one hour.
+   */
+  async request(method, path, { query, body, idempotencyKey: key } = {}) {
     const isWrite = method !== 'GET';
-    const idempotencyKey = isWrite ? crypto.randomUUID() : null;
+    const idempotencyKey = isWrite ? key || crypto.randomUUID() : null;
     let refreshed = false;
 
     for (let attempt = 0; ; attempt += 1) {
@@ -89,7 +94,10 @@ export class TidalClient {
       }
 
       // 409 on a retried write means "original still processing" under the idempotency contract.
-      const retryable = res.status === 429 || res.status >= 500 || (isWrite && attempt > 0 && res.status === 409);
+      // 409 on a write means "a request with this Idempotency-Key is still processing" — either our
+      // own earlier attempt, or (with a caller-supplied key) a previous workflow attempt.
+      const inFlight = isWrite && res.status === 409 && (attempt > 0 || Boolean(key));
+      const retryable = res.status === 429 || res.status >= 500 || inFlight;
       if (retryable && attempt < this.maxRetries) {
         await this.sleep(retryAfterMs(res) ?? backoff(attempt));
         continue;
@@ -114,8 +122,8 @@ export class TidalClient {
     return this.request('GET', path, { query });
   }
 
-  post(path, body, query) {
-    return this.request('POST', path, { body, query });
+  post(path, body, { query, idempotencyKey } = {}) {
+    return this.request('POST', path, { body, query, idempotencyKey });
   }
 }
 

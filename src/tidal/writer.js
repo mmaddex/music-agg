@@ -5,24 +5,30 @@
 //        { data: [{ type: "tracks", id, meta: { addedAt } }], meta: { onDuplicates } }
 //   POST /userCollectionTracks/me/relationships/items     (collection.write) ≤ 50 items per call
 //        { data: [{ type: "tracks", id, meta: { addedAt } }] }
+//
+// Each function performs ONE write so the caller (a workflow task) can checkpoint between
+// writes. Callers pass a deterministic `idempotencyKey`: if a retried task re-sends a write
+// that had actually succeeded, TIDAL replays the original response instead of applying it
+// twice.
 
 export const BATCH_SIZE = 50;
 
-// createdAt / addedAt are optional niceties (they preserve the original dates). If TIDAL
-// rejects them for this client, retry without rather than failing the import.
-async function withDateFallback(send, payloadWithDates, payloadWithout) {
-  try {
-    return await send(payloadWithDates);
-  } catch (err) {
-    if (err.status === 400 && payloadWithout) return send(payloadWithout);
-    throw err;
-  }
-}
-
-function chunk(list, size) {
+export function chunk(list, size = BATCH_SIZE) {
   const out = [];
   for (let i = 0; i < list.length; i += size) out.push(list.slice(i, i + size));
   return out;
+}
+
+// createdAt / addedAt are optional niceties (they preserve the original dates). If TIDAL
+// rejects them for this client, retry once without — under a different idempotency key,
+// since the payload differs.
+async function withDateFallback(send, withDates, withoutDates, idempotencyKey) {
+  try {
+    return await send(withDates, idempotencyKey);
+  } catch (err) {
+    if (err.status === 400 && withoutDates) return send(withoutDates, idempotencyKey && `${idempotencyKey.slice(0, -4)}0000`);
+    throw err;
+  }
 }
 
 function itemData(items, { withDates = true } = {}) {
@@ -35,37 +41,33 @@ function itemData(items, { withDates = true } = {}) {
 
 const hasDates = (items) => items.some((i) => i.addedAt);
 
-export async function createPlaylist(client, { name, description, createdAt, accessType = 'UNLISTED' }) {
+export async function createPlaylist(client, { name, description, createdAt, accessType = 'UNLISTED' }, { idempotencyKey } = {}) {
   const attributes = { name: String(name).slice(0, 250), accessType };
   if (description) attributes.description = String(description).slice(0, 500);
-  const send = (attrs) => client.post('/playlists', { data: { type: 'playlists', attributes: attrs } });
+  const send = (attrs, key) => client.post('/playlists', { data: { type: 'playlists', attributes: attrs } }, { idempotencyKey: key });
   const doc = createdAt
-    ? await withDateFallback(send, { ...attributes, createdAt }, attributes)
-    : await send(attributes);
+    ? await withDateFallback(send, { ...attributes, createdAt }, attributes, idempotencyKey)
+    : await send(attributes, idempotencyKey);
   return { id: doc.data.id, name: doc.data.attributes?.name || attributes.name };
 }
 
-/** items: [{ id, addedAt? }] in playlist order. */
-export async function addPlaylistItems(client, playlistId, items, { onProgress } = {}) {
-  let added = 0;
-  for (const batch of chunk(items, BATCH_SIZE)) {
-    const path = `/playlists/${encodeURIComponent(playlistId)}/relationships/items`;
-    const send = (data) => client.post(path, { data, meta: { onDuplicates: 'ADD' } });
-    await withDateFallback(send, itemData(batch), hasDates(batch) ? itemData(batch, { withDates: false }) : null);
-    added += batch.length;
-    onProgress?.(added, items.length);
-  }
-  return added;
+// Responses list items TIDAL did not add in meta.skipped (reason ALREADY_PRESENT / NOT_FOUND).
+function outcome(doc, sent) {
+  const skipped = Array.isArray(doc?.meta?.skipped) ? doc.meta.skipped.length : 0;
+  return { added: Math.max(0, sent - skipped), skipped };
 }
 
-/** items: [{ id, addedAt? }]. Adds to the user's My Collection › Tracks. */
-export async function addFavoriteTracks(client, items, { onProgress } = {}) {
-  let added = 0;
-  for (const batch of chunk(items, BATCH_SIZE)) {
-    const send = (data) => client.post('/userCollectionTracks/me/relationships/items', { data });
-    await withDateFallback(send, itemData(batch), hasDates(batch) ? itemData(batch, { withDates: false }) : null);
-    added += batch.length;
-    onProgress?.(added, items.length);
-  }
-  return added;
+/** Add up to BATCH_SIZE tracks to a playlist. items: [{ id, addedAt? }] → { added, skipped } */
+export async function addPlaylistBatch(client, playlistId, items, { idempotencyKey } = {}) {
+  const path = `/playlists/${encodeURIComponent(playlistId)}/relationships/items`;
+  const send = (data, key) => client.post(path, { data, meta: { onDuplicates: 'ADD' } }, { idempotencyKey: key });
+  const doc = await withDateFallback(send, itemData(items), hasDates(items) ? itemData(items, { withDates: false }) : null, idempotencyKey);
+  return outcome(doc, items.length);
+}
+
+/** Add up to BATCH_SIZE tracks to My Collection › Tracks. Already-saved tracks are skipped by TIDAL. */
+export async function addFavoritesBatch(client, items, { idempotencyKey } = {}) {
+  const send = (data, key) => client.post('/userCollectionTracks/me/relationships/items', { data }, { idempotencyKey: key });
+  const doc = await withDateFallback(send, itemData(items), hasDates(items) ? itemData(items, { withDates: false }) : null, idempotencyKey);
+  return outcome(doc, items.length);
 }

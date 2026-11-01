@@ -99,3 +99,11 @@ details.coll .table-wrap { overflow-x: auto; padding: 0 8px 8px; }
   .select-table th:nth-child(3), .select-table td:nth-child(3) { display: none; }
   .track-table select { max-width: 200px; }
 }
+
+.recent { margin-top: 20px; }
+.recent h3 { font-size: 15px; margin: 0 0 6px; }
+.recent ul { list-style: none; padding: 0; margin: 0; }
+.recent li { display: flex; gap: 10px; align-items: center; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+.recent .meta { font-size: 13px; color: var(--muted); }
+.failed { margin-top: 12px; padding: 12px; border-radius: 8px; border: 1px solid var(--bad); background: color-mix(in srgb, var(--bad) 8%, var(--card)); }
+.failed p { margin: 0; }

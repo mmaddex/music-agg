@@ -10,16 +10,20 @@
   },
   "scripts": {
     "start": "node src/server.js",
+    "start:workflows": "node src/workflows/main.js",
     "dev": "node --watch src/server.js",
-    "test": "node --test \"test/**/*.test.js\"",
+    "test": "node --test \"test/*.test.js\"",
+    "test:db": "TEST_DATABASE_URL=${TEST_DATABASE_URL:-postgresql://musicagg:musicagg@localhost:5432/musicagg_test} node --test \"test/*.test.js\"",
     "inspect-export": "node scripts/inspect-export.js"
   },
   "dependencies": {
+    "@renderinc/sdk": "^1.6.0",
+    "connect-pg-simple": "^10.0.0",
     "csv-parse": "^7.0.3",
     "express": "^5.1.0",
     "express-session": "^1.18.2",
-    "memorystore": "^1.6.7",
     "multer": "^2.0.2",
+    "pg": "^8.23.1",
     "yauzl": "^3.4.0"
   }
 }

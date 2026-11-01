@@ -3,62 +3,90 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import express from 'express';
 import session from 'express-session';
-import createMemoryStore from 'memorystore';
+import connectPgSimple from 'connect-pg-simple';
 import multer from 'multer';
 
 import { config, configProblems } from './config.js';
-import { buildAuthorizeUrl, createPkcePair, createState, exchangeCode, refreshTokens } from './auth/tidalAuth.js';
+import { buildAuthorizeUrl, createPkcePair, createState, exchangeCode } from './auth/tidalAuth.js';
 import { TidalClient } from './tidal/client.js';
 import { getMe } from './tidal/catalog.js';
 import { listFormats, parseExport, UnknownFormatError } from './importers/registry.js';
 import { BundleError } from './importers/bundle.js';
 import { summarizeLibrary } from './importers/model.js';
-import { clearState, getState, newId, peekState } from './state.js';
-import { publicJob, startJob } from './jobs.js';
-import { runImport, runMatch } from './importService.js';
+import { clearTokens, getAccount, upsertAccount } from './accounts.js';
+import * as repo from './imports/repo.js';
+import { createPool, migrate } from './db/pool.js';
+import { buildDeps, setDeps, workflowSettings } from './workflows/deps.js';
+import { createInlineDispatcher, createRenderDispatcher } from './workflows/dispatch.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
-/** A TidalClient bound to one session's tokens, refreshing them as needed. */
-export function clientForState(state, { fetchImpl = fetch } = {}) {
-  let refreshing = null;
-  const refresh = async () => {
-    refreshing ??= refreshTokens({ clientId: config.tidal.clientId, tokens: state.tokens, fetchImpl })
-      .then((t) => {
-        state.tokens = t;
-        return t.accessToken;
-      })
-      .finally(() => {
-        refreshing = null;
-      });
-    return refreshing;
-  };
-  return new TidalClient({
-    fetchImpl,
-    minIntervalMs: config.tidalMinIntervalMs,
-    getAccessToken: async () => {
-      if (!state.tokens) throw Object.assign(new Error('Not logged in to TIDAL'), { status: 401 });
-      if (Date.now() >= state.tokens.expiresAt) return refresh();
-      return state.tokens.accessToken;
-    },
-    forceRefresh: refresh,
-  });
+class HttpError extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
+  }
 }
 
-export function createApp({ fetchImpl = fetch } = {}) {
+/** Build the JSON the browser polls for one import. */
+async function importView(pool, imp, { withResults = false } = {}) {
+  const view = {
+    id: imp.id,
+    filename: imp.filename,
+    format: imp.format,
+    formatLabel: imp.format_label,
+    status: imp.status,
+    stage: imp.stage,
+    error: imp.error,
+    warnings: imp.warnings,
+    selected: imp.selected,
+    createdAt: imp.created_at,
+    collections: summarizeLibrary({ format: imp.format, formatLabel: imp.format_label, warnings: [], collections: imp.library.collections }).collections,
+    progress: null,
+  };
+  if (imp.stage === 'match' || imp.stage === 'load') {
+    const counts = await repo.trackCounts(pool, imp.id);
+    view.matchStats = counts;
+    if (imp.stage === 'match') view.progress = { phase: 'Finding your music on TIDAL', done: counts.total - counts.pending, total: counts.total };
+  }
+  if (imp.stage === 'load') {
+    const targets = await repo.getTargets(pool, imp.id);
+    let done = 0;
+    let total = 0;
+    view.targets = targets.map((t) => {
+      total += t.items.length;
+      done += Math.min(t.items.length, t.batches_done * 50);
+      return {
+        id: t.collection_id,
+        kind: t.kind,
+        name: t.name,
+        status: t.status,
+        added: t.added,
+        skipped: t.skipped,
+        error: t.error,
+        url: t.kind === 'favorites' ? 'https://tidal.com/my-collection/tracks' : t.tidal_playlist_id ? `https://tidal.com/playlist/${t.tidal_playlist_id}` : null,
+      };
+    });
+    view.progress = { phase: 'Importing to TIDAL', done, total };
+  }
+  if (withResults && imp.stage) view.results = await repo.matchResults(pool, imp);
+  return view;
+}
+
+export function createApp({ pool, dispatcher, fetchImpl = fetch }) {
   const app = express();
   app.set('trust proxy', 1); // Render terminates TLS in front of us
   app.disable('x-powered-by');
 
-  const MemoryStore = createMemoryStore(session);
+  const PgStore = connectPgSimple(session);
   app.use(
     session({
       name: 'music_agg.sid',
       secret: config.sessionSecret || crypto.randomBytes(32).toString('hex'),
-      store: new MemoryStore({ checkPeriod: 60 * 60 * 1000 }),
+      store: new PgStore({ pool, createTableIfMissing: true, pruneSessionInterval: 60 * 60 }),
       resave: false,
       saveUninitialized: false,
-      cookie: { httpOnly: true, sameSite: 'lax', secure: config.isProduction ? true : 'auto', maxAge: 7 * 24 * 3600 * 1000 },
+      cookie: { httpOnly: true, sameSite: 'lax', secure: config.isProduction ? true : 'auto', maxAge: 30 * 24 * 3600 * 1000 },
     }),
   );
   app.use(express.json({ limit: '5mb' }));
@@ -66,31 +94,63 @@ export function createApp({ fetchImpl = fetch } = {}) {
 
   const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: config.maxUploadBytes, files: 1 } });
 
-  const stateOf = (req) => {
-    req.session.touched = true; // make sure the session (and its cookie) persist
-    return getState(req.sessionID);
-  };
-  const requireLogin = (req, res, next) => {
-    const state = peekState(req.sessionID);
-    if (!state?.tokens) return res.status(401).json({ error: 'Please log in with TIDAL first.' });
-    req.state = state;
+  const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+  // The session store is async: persist before redirecting, or the browser can arrive at the
+  // next URL before the session row exists (losing the PKCE verifier or the login).
+  const saveSession = (req) => new Promise((resolve, reject) => req.session.save((e) => (e ? reject(e) : resolve())));
+
+  const requireLogin = wrap(async (req, res, next) => {
+    const account = req.session.accountId ? await getAccount(pool, req.session.accountId) : null;
+    if (!account?.has_tokens) return res.status(401).json({ error: 'Please log in with TIDAL first.' });
+    req.account = account;
     next();
+  });
+
+  const loadImport = async (req) => {
+    const imp = await repo.getImport(pool, req.params.importId, req.account.id);
+    if (!imp) throw new HttpError(404, 'Import not found.');
+    return imp;
   };
 
-  app.get('/healthz', (req, res) => res.json({ ok: true }));
+  /** Atomically move an import into an active status so double-clicks can't start two runs. */
+  const claim = async (importId, fromStatuses, toStatus, stage) => {
+    const { rowCount } = await pool.query(
+      `UPDATE imports SET status = $3, stage = $4, error = NULL, updated_at = now() WHERE id = $1 AND status = ANY($2::text[])`,
+      [importId, fromStatuses, toStatus, stage],
+    );
+    if (!rowCount) throw new HttpError(409, 'This import is busy or not ready for that step.');
+  };
+
+  const dispatch = async (imp, taskName, stage) => {
+    const n = await repo.bumpDispatchCount(pool, imp.id);
+    try {
+      const runId = await dispatcher.start(taskName, [imp.id], { idempotencyKey: `${imp.id}:${stage}:${n}` });
+      await pool.query(`UPDATE imports SET ${stage === 'load' ? 'load_run_id' : 'match_run_id'} = $2 WHERE id = $1`, [imp.id, runId]);
+    } catch (err) {
+      console.error(`Failed to start ${taskName}`, err);
+      await repo.setStatus(pool, imp.id, 'failed', { error: `Could not start the ${stage} workflow (${err.message}). Press Retry.` });
+      throw new HttpError(502, 'Could not start the workflow. Please press Retry.');
+    }
+  };
+
+  app.get('/healthz', wrap(async (req, res) => {
+    await pool.query('SELECT 1');
+    res.json({ ok: true });
+  }));
 
   // ---- Auth -------------------------------------------------------------------------
 
-  app.get('/auth/login', (req, res) => {
-    const problems = configProblems();
+  app.get('/auth/login', wrap(async (req, res) => {
+    const problems = configProblems().filter((p) => !p.startsWith('Running workflows inline'));
     if (problems.length) return res.status(500).send(`Server is not configured: ${problems.join(' ')}`);
     const { verifier, challenge } = createPkcePair();
     const state = createState();
     req.session.oauth = { verifier, state };
+    await saveSession(req);
     res.redirect(buildAuthorizeUrl({ clientId: config.tidal.clientId, redirectUri: config.tidal.redirectUri, challenge, state }));
-  });
+  }));
 
-  app.get('/auth/callback', async (req, res) => {
+  app.get('/auth/callback', wrap(async (req, res) => {
     const { code, state, error, error_description: description } = req.query;
     const pending = req.session.oauth;
     delete req.session.oauth;
@@ -99,98 +159,120 @@ export function createApp({ fetchImpl = fetch } = {}) {
       return res.redirect(`/?authError=${encodeURIComponent('Login expired or was tampered with. Please try again.')}`);
     }
     try {
-      const tokens = await exchangeCode({
-        clientId: config.tidal.clientId,
-        code,
-        redirectUri: config.tidal.redirectUri,
-        verifier: pending.verifier,
-        fetchImpl,
-      });
+      const tokens = await exchangeCode({ clientId: config.tidal.clientId, code, redirectUri: config.tidal.redirectUri, verifier: pending.verifier, fetchImpl });
+      const me = await getMe(new TidalClient({ fetchImpl, getAccessToken: async () => tokens.accessToken }));
+      const account = await upsertAccount(pool, { tidalUserId: me.id, username: me.username, country: me.country, tokens });
       // New session id after login (session fixation protection).
       await new Promise((resolve, reject) => req.session.regenerate((e) => (e ? reject(e) : resolve())));
-      const st = stateOf(req);
-      st.tokens = tokens;
-      st.user = await getMe(clientForState(st, { fetchImpl }));
+      req.session.accountId = account.id;
+      await saveSession(req);
       res.redirect('/');
     } catch (err) {
       console.error('TIDAL login failed', err);
       res.redirect(`/?authError=${encodeURIComponent(err.message)}`);
     }
-  });
+  }));
 
-  app.post('/auth/logout', (req, res) => {
-    clearState(req.sessionID);
+  app.post('/auth/logout', wrap(async (req, res) => {
+    const accountId = req.session.accountId;
+    if (accountId) {
+      // Keep tokens while a workflow is still running on the user's behalf.
+      const { rows } = await pool.query(`SELECT 1 FROM imports WHERE account_id = $1 AND status = ANY($2::text[]) LIMIT 1`, [accountId, repo.ACTIVE_STATUSES]);
+      if (!rows.length) await clearTokens(pool, accountId);
+    }
     req.session.destroy(() => res.json({ ok: true }));
-  });
+  }));
 
   // ---- API --------------------------------------------------------------------------
 
-  app.get('/api/me', (req, res) => {
-    const st = peekState(req.sessionID);
+  app.get('/api/me', wrap(async (req, res) => {
+    const account = req.session.accountId ? await getAccount(pool, req.session.accountId) : null;
     res.json({
-      loggedIn: !!st?.tokens,
-      user: st?.user || null,
+      loggedIn: Boolean(account?.has_tokens),
+      user: account ? { username: account.username, country: account.country } : null,
       configProblems: configProblems(),
       formats: listFormats(),
+      workflowMode: dispatcher.mode,
     });
-  });
+  }));
 
-  app.post('/api/uploads', requireLogin, upload.single('file'), async (req, res) => {
+  app.get('/api/imports', requireLogin, wrap(async (req, res) => {
+    res.json({ imports: await repo.listImports(pool, req.account.id) });
+  }));
+
+  app.post('/api/uploads', requireLogin, upload.single('file'), wrap(async (req, res) => {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded.' });
+    let library;
     try {
-      const library = await parseExport({ filename: req.file.originalname, buffer: req.file.buffer, formatId: req.body?.format || undefined });
-      const id = newId();
-      req.state.uploads.clear(); // one active upload per session keeps memory bounded
-      req.state.uploads.set(id, { id, filename: req.file.originalname, library, createdAt: Date.now() });
-      res.json({ uploadId: id, filename: req.file.originalname, ...summarizeLibrary(library) });
+      library = await parseExport({ filename: req.file.originalname, buffer: req.file.buffer, formatId: req.body?.format || undefined });
     } catch (err) {
       if (err instanceof BundleError || err instanceof UnknownFormatError) return res.status(422).json({ error: err.message });
-      console.error('Upload parse failed', err);
-      res.status(500).json({ error: `Could not read this export: ${err.message}` });
+      throw err;
     }
-  });
+    const id = await repo.createImport(pool, { accountId: req.account.id, filename: req.file.originalname, library });
+    res.json(await importView(pool, await repo.getImport(pool, id)));
+  }));
 
-  app.post('/api/uploads/:uploadId/match', requireLogin, (req, res) => {
-    const up = req.state.uploads.get(req.params.uploadId);
-    if (!up) return res.status(404).json({ error: 'Upload not found; please upload the export again.' });
+  app.get('/api/imports/:importId', requireLogin, wrap(async (req, res) => {
+    const imp = await loadImport(req);
+    res.json(await importView(pool, imp, { withResults: req.query.results === '1' }));
+  }));
+
+  app.post('/api/imports/:importId/match', requireLogin, wrap(async (req, res) => {
+    const imp = await loadImport(req);
     const collectionIds = Array.isArray(req.body?.collectionIds) ? req.body.collectionIds.map(String) : [];
-    if (!collectionIds.length) return res.status(400).json({ error: 'Choose at least one playlist or library.' });
-    const client = clientForState(req.state, { fetchImpl });
-    const countryCode = req.state.user?.country || 'US';
-    const job = startJob(req.state, 'match', (update) =>
-      runMatch({ library: up.library, collectionIds, client, countryCode, update, fetchImpl }),
-    );
-    up.matchJobId = job.id;
-    res.status(202).json(publicJob(job, { includeResult: false }));
-  });
-
-  app.post('/api/imports', requireLogin, (req, res) => {
-    const matchJob = req.state.jobs.get(String(req.body?.matchJobId || ''));
-    if (!matchJob || matchJob.type !== 'match' || matchJob.status !== 'done') {
-      return res.status(400).json({ error: 'Run matching first.' });
+    if (!collectionIds.length) throw new HttpError(400, 'Choose at least one playlist or library.');
+    // Once writing to TIDAL has started, only Retry may continue it (re-matching could duplicate playlists).
+    if (imp.stage === 'load') throw new HttpError(409, 'This import has already started writing to TIDAL. Use Retry instead.');
+    await claim(imp.id, ['parsed', 'matched', 'failed'], 'matching', 'match');
+    try {
+      await repo.prepareMatch(pool, imp, collectionIds, req.account.country || 'US');
+    } catch (err) {
+      await repo.setStatus(pool, imp.id, 'parsed', { stage: null });
+      throw new HttpError(400, err.message);
     }
+    await dispatch(imp, 'matchImport', 'match');
+    res.status(202).json(await importView(pool, await repo.getImport(pool, imp.id)));
+  }));
+
+  app.post('/api/imports/:importId/load', requireLogin, wrap(async (req, res) => {
+    const imp = await loadImport(req);
     const targets = Array.isArray(req.body?.collections) ? req.body.collections : [];
     const decisions = req.body?.decisions && typeof req.body.decisions === 'object' ? req.body.decisions : {};
-    const client = clientForState(req.state, { fetchImpl });
-    const job = startJob(req.state, 'import', (update) =>
-      runImport({ matchResult: matchJob.result, targets, decisions, client, update }),
-    );
-    res.status(202).json(publicJob(job, { includeResult: false }));
-  });
+    await claim(imp.id, ['matched'], 'loading', 'load');
+    try {
+      await repo.prepareLoad(pool, imp, targets, decisions);
+    } catch (err) {
+      await repo.setStatus(pool, imp.id, 'matched', { stage: 'match' });
+      throw new HttpError(400, err.message);
+    }
+    await dispatch(imp, 'loadToTidal', 'load');
+    res.status(202).json(await importView(pool, await repo.getImport(pool, imp.id)));
+  }));
 
-  app.get('/api/jobs/:jobId', requireLogin, (req, res) => {
-    const job = req.state.jobs.get(req.params.jobId);
-    if (!job) return res.status(404).json({ error: 'Job not found.' });
-    res.json(publicJob(job, { includeResult: job.status !== 'running' }));
-  });
+  // Resume a failed import from its checkpoints.
+  app.post('/api/imports/:importId/retry', requireLogin, wrap(async (req, res) => {
+    const imp = await loadImport(req);
+    if (imp.status !== 'failed' || !imp.stage) throw new HttpError(409, 'Only failed imports can be retried.');
+    if (imp.stage === 'match') {
+      await claim(imp.id, ['failed'], 'matching', 'match');
+      await pool.query(`UPDATE import_tracks SET status = 'pending', attempts = 0 WHERE import_id = $1 AND status = 'error'`, [imp.id]);
+      await dispatch(imp, 'matchImport', 'match');
+    } else {
+      await claim(imp.id, ['failed'], 'loading', 'load');
+      await pool.query(`UPDATE import_targets SET status = 'pending', error = NULL WHERE import_id = $1 AND status <> 'done'`, [imp.id]);
+      await dispatch(imp, 'loadToTidal', 'load');
+    }
+    res.status(202).json(await importView(pool, await repo.getImport(pool, imp.id)));
+  }));
 
-  // Multer/size errors and anything else unhandled.
   app.use((err, req, res, next) => {
     if (res.headersSent) return next(err);
     if (err instanceof multer.MulterError) {
       const msg = err.code === 'LIMIT_FILE_SIZE' ? `File is larger than ${config.maxUploadBytes / 1024 / 1024} MB.` : err.message;
       return res.status(413).json({ error: msg });
     }
+    if (err instanceof HttpError) return res.status(err.status).json({ error: err.message });
     console.error(err);
     res.status(500).json({ error: 'Unexpected server error.' });
   });
@@ -198,10 +280,29 @@ export function createApp({ fetchImpl = fetch } = {}) {
   return app;
 }
 
+/** Wire up Postgres + the workflow dispatcher from config. */
+export async function createRuntime({ fetchImpl = fetch } = {}) {
+  const pool = createPool(config.databaseUrl, { max: 10 });
+  await migrate(pool);
+  let dispatcher;
+  if (config.workflows.mode === 'render') {
+    dispatcher = createRenderDispatcher({ workflowSlug: config.workflows.slug });
+  } else {
+    // Local development: run the workflow tasks in this process against the same database.
+    setDeps(buildDeps({ pool, fetchImpl, settings: workflowSettings() }));
+    dispatcher = createInlineDispatcher();
+  }
+  return { pool, dispatcher };
+}
+
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const problems = configProblems();
   if (problems.length) console.warn(`Configuration warning: ${problems.join(' ')}`);
-  createApp().listen(config.port, () => {
-    console.log(`music-agg listening on :${config.port} (redirect URI ${config.tidal.redirectUri})`);
+  const { pool, dispatcher } = await createRuntime();
+  const cleanup = () => repo.deleteOldImports(pool, config.retentionDays).catch((e) => console.error('cleanup failed', e));
+  cleanup();
+  setInterval(cleanup, 24 * 3600 * 1000).unref();
+  createApp({ pool, dispatcher }).listen(config.port, () => {
+    console.log(`music-agg listening on :${config.port} (workflows: ${dispatcher.mode}, redirect URI ${config.tidal.redirectUri})`);
   });
 }

@@ -1,0 +1,72 @@
+-- Shared, durable state for the web service and the Render Workflow tasks.
+-- Every statement is idempotent; migrate.js runs this file on startup under an advisory lock.
+
+-- A TIDAL user who has logged in. Tokens are AES-256-GCM encrypted (see src/crypto.js).
+CREATE TABLE IF NOT EXISTS accounts (
+  id             uuid PRIMARY KEY,
+  tidal_user_id  text NOT NULL UNIQUE,
+  username       text,
+  country        text,
+  tokens_enc     text,
+  created_at     timestamptz NOT NULL DEFAULT now(),
+  updated_at     timestamptz NOT NULL DEFAULT now()
+);
+
+-- One uploaded export and its progress through match → load.
+--   status: parsed | matching | matched | loading | done | failed
+--   stage:  which workflow last ran / should be retried: match | load
+CREATE TABLE IF NOT EXISTS imports (
+  id                uuid PRIMARY KEY,
+  account_id        uuid NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  filename          text NOT NULL,
+  format            text NOT NULL,
+  format_label      text NOT NULL,
+  library           jsonb NOT NULL,          -- collections + tracks, as parsed
+  warnings          jsonb NOT NULL DEFAULT '[]',
+  selected          jsonb NOT NULL DEFAULT '[]',  -- collection ids chosen for matching
+  country_code      text,
+  status            text NOT NULL,
+  stage             text,
+  error             text,
+  match_run_id      text,
+  load_run_id       text,
+  dispatch_count    integer NOT NULL DEFAULT 0,
+  created_at        timestamptz NOT NULL DEFAULT now(),
+  updated_at        timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS imports_account_idx ON imports (account_id, created_at DESC);
+
+-- Checkpoint per unique source track: written as soon as that track is matched.
+--   status: pending | matched | review | not_found | error
+CREATE TABLE IF NOT EXISTS import_tracks (
+  import_id   uuid NOT NULL REFERENCES imports(id) ON DELETE CASCADE,
+  key         text NOT NULL,
+  track       jsonb NOT NULL,               -- source track, incl. YouTube enrichment once done
+  status      text NOT NULL DEFAULT 'pending',
+  match       jsonb,
+  attempts    integer NOT NULL DEFAULT 0,   -- transient failures for this track
+  updated_at  timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (import_id, key)
+);
+CREATE INDEX IF NOT EXISTS import_tracks_pending_idx ON import_tracks (import_id) WHERE status = 'pending';
+
+-- Checkpoint per collection being written to TIDAL.
+--   status: pending | done | failed
+CREATE TABLE IF NOT EXISTS import_targets (
+  import_id          uuid NOT NULL REFERENCES imports(id) ON DELETE CASCADE,
+  collection_id      text NOT NULL,
+  position           integer NOT NULL,
+  kind               text NOT NULL,          -- playlist | favorites
+  name               text NOT NULL,
+  description        text,
+  created_at_source  text,
+  items              jsonb NOT NULL,         -- [{ id, addedAt }] TIDAL track ids, in order
+  tidal_playlist_id  text,
+  batches_done       integer NOT NULL DEFAULT 0,
+  added              integer NOT NULL DEFAULT 0,
+  skipped            integer NOT NULL DEFAULT 0,
+  status             text NOT NULL DEFAULT 'pending',
+  error              text,
+  updated_at         timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (import_id, collection_id)
+);

@@ -1,109 +1,166 @@
 # music-agg
 
-A small web app that imports music-service exports into **TIDAL**. You log in with your TIDAL
-account, upload an export, review the matches, and the app creates the playlists and adds
-favourites in your TIDAL account.
+A web app that imports music-service exports into **TIDAL**. You log in with your TIDAL
+account and upload an export. Then you review the matches, and the app creates the playlists
+and adds favourites in your TIDAL account.
 
 Today it supports **YouTube Music (Google Takeout)** and **plain CSV files with title/artist
 columns**. The importer is built so Google Play Music, Apple Music and other exports can be
 added as small plug-in adapters (see [Adding an export format](#adding-an-export-format)).
 
-## How it works
+The slow, network-heavy work runs as **[Render Workflows](https://render.com/docs/workflows)**:
+*matching* (finding each song on TIDAL) and *loading* (writing playlists and favourites).
+Each step gets retries with backoff, and an import resumes from its last checkpoint after a
+failure, a deploy or a crash.
+
+## Architecture
 
 ```
-upload (.zip / .csv)
-  └─ bundle loader      zip or text file  → flat list of text files       src/importers/bundle.js
-      └─ format adapter  files            → Library (playlists, favourites) src/importers/adapters/*
-          └─ enrichers   video-id-only tracks → title/artist (YouTube oEmbed) src/enrich/youtube.js
-              └─ matcher  Library tracks  → TIDAL track ids (ISRC, then search + scoring) src/tidal/matcher.js
-                  └─ review in the browser (accept / change / skip)
-                      └─ writer  → TIDAL playlists + My Collection tracks   src/tidal/writer.js
+Browser ──► Web service (Express)                     Render Workflow service
+            • TIDAL login (OAuth 2.1 + PKCE)            src/workflows/main.js
+            • upload → parse → store import
+            • start runs ─────── Render SDK ─────────►  matchImport(importId)
+            • poll status                                 └─ matchChunk(importId, keys) × N
+                    │                                   loadToTidal(importId)
+                    ▼                                     └─ writeCollection(importId, collectionId) × M
+              Postgres  ◄───────────────────────────────────────┘
+              accounts (encrypted TIDAL tokens) · imports · import_tracks (per-track
+              checkpoints) · import_targets (per-collection write cursor) · sessions
 ```
 
-* **Login:** OAuth 2.1 authorization code + PKCE, exactly as in TIDAL's
-  [authorization guide](https://developer.tidal.com/documentation/api-sdk/api-sdk-authorization).
-  Users sign in on `login.tidal.com`. The app never sees their password. Tokens are kept
-  server-side and refreshed automatically.
-* **API:** TIDAL API v2 (`https://openapi.tidal.com/v2`, JSON:API), per the
-  [API reference](https://tidal-music.github.io/tidal-api-reference/). Scopes requested:
-  `user.read search.read playlists.write collection.write`.
+* **Parsing stays in the web service.** It takes under a second, makes no network calls, and
+  you see the result right away to pick playlists. Retries would add nothing.
+* **Task inputs are only ids.** Track data and TIDAL tokens are read from Postgres, never
+  passed as run arguments. Run arguments are visible in the Render Dashboard and capped at 4 MB.
 
-  | Step                | Endpoint                                                        |
-  | ------------------- | --------------------------------------------------------------- |
-  | Who's logged in     | `GET /users/me`                                                 |
-  | Match by ISRC       | `GET /tracks?filter[isrc]=…&include=artists,albums`             |
-  | Match by search     | `GET /searchResults?filter[query]=…&include=tracks.artists,tracks.albums` |
-  | Create playlist     | `POST /playlists` (created as `UNLISTED`)                       |
-  | Add playlist tracks | `POST /playlists/{id}/relationships/items` (≤ 50 per call)      |
-  | Add favourites      | `POST /userCollectionTracks/me/relationships/items` (≤ 50 per call) |
+### Why an import survives failures
 
-  Requests are rate-limited per user. `429` responses honour `Retry-After`. Writes carry an
-  `Idempotency-Key` so a retry never adds tracks twice.
-* **Matching:** each track is scored on title, artist, album, duration and version markers
-  (live / remix / karaoke …). It is then marked *matched* (imported by default), *needs review*
-  (you decide), or *not found*. The same song in several playlists is looked up once.
+| Task | Checkpoint | On retry |
+| ---- | ---------- | -------- |
+| `matchChunk` (~100 tracks) | each track's result is saved as soon as it's known | only tracks still `pending` are processed |
+| `writeCollection` (one playlist / favourites) | created playlist id, then a cursor after every 50-track batch | resumes at the next batch; never creates a second playlist |
+| roots `matchImport` / `loadToTidal` | status on the import row | fan out only the unfinished work |
+
+* **No double-writes:** each TIDAL write sends an `Idempotency-Key` derived from
+  *(import, collection, batch)*. If a batch succeeded but the task crashed before saving the
+  cursor, the retry sends the same key and TIDAL replays the original response.
+* **Error policy:** the SDK retries any thrown error, so tasks throw only for transient
+  problems (429, 5xx, network, timeouts). Permanent problems are recorded instead: one bad
+  track, one rejected playlist, or an expired login. A track that keeps failing is given up on
+  after 4 tries so it can't block the rest.
+* **Expired login:** the import stops with "log in again, then press Retry". After you log in,
+  Retry picks up where it stopped.
+* **Token refresh** happens under a row lock, so parallel task instances never race each
+  other and invalidate the refresh token.
+
+Task settings (`src/workflows/tasks.js`):
+
+| Task | Retries (backoff) | Timeout | Plan |
+| ---- | ----------------- | ------- | ---- |
+| `matchChunk`, `writeCollection` | 6 × from 15 s, ×2 | 30 min | starter |
+| `matchImport`, `loadToTidal` | 2 × from 30 s, ×2 | 12 h | starter |
+
+## TIDAL API usage
+
+Login and endpoints follow TIDAL's
+[authorization guide](https://developer.tidal.com/documentation/api-sdk/api-sdk-authorization)
+and [API reference](https://tidal-music.github.io/tidal-api-reference/) (v2, JSON:API).
+Scopes requested: `user.read search.read playlists.write collection.write`.
+
+| Step | Endpoint |
+| ---- | -------- |
+| Who's logged in | `GET /users/me` |
+| Match by ISRC | `GET /tracks?filter[isrc]=…&include=artists,albums` |
+| Match by search | `GET /searchResults?filter[query]=…&include=tracks.artists,tracks.albums` |
+| Create playlist | `POST /playlists` (created as `UNLISTED`) |
+| Add playlist tracks | `POST /playlists/{id}/relationships/items` (≤ 50 per call) |
+| Add favourites | `POST /userCollectionTracks/me/relationships/items` (≤ 50; already-saved tracks come back in `meta.skipped`) |
+
+Matching scores each candidate on title, artist, album, duration and version markers
+(live / remix / karaoke …). Each track ends up *matched* (imported by default), *needs review*
+(you decide; there's a bulk "accept suggestions" button) or *not found*.
 
 ### About the YouTube Music export
 
-Takeout's playlist CSVs contain only **YouTube video ids**, with no song or artist. The app
-fills in what it can from `music-library-songs.csv`, which does have titles. For the rest it
-looks up the video's title and channel through YouTube's public oEmbed endpoint
-(`https://www.youtube.com/oembed`, no API key needed). Matches built from video titles are
-held to a stricter threshold, so more of them land in *needs review*. Private or deleted
-videos show as *not found*.
-
-* `Library songs` → added to TIDAL **My Collection › Tracks**.
-* Each playlist → a new TIDAL playlist. You can rename it before importing. The original
-  "time added" dates are sent along (`meta.addedAt`).
-* `Watch later` and `Uploads from …` are listed but unchecked by default.
+Takeout's playlist CSVs contain only **YouTube video ids**, with no song or artist. Titles
+come from `music-library-songs.csv` where possible. For the rest, the app asks YouTube's
+public oEmbed endpoint for the video's title and channel; no API key is needed. Matches built
+from video titles must clear a stricter threshold. Private or deleted videos show as
+*not found*.
 
 ## Running locally
 
-Requires Node 20+.
+Requires Node 20+ and a Postgres database.
 
 ```bash
 npm install
-cp .env.example .env            # set TIDAL_CLIENT_ID
+cp .env.example .env        # set TIDAL_CLIENT_ID, DATABASE_URL, TOKEN_ENCRYPTION_KEY
 node --env-file=.env src/server.js
-# open http://localhost:3000
 ```
 
-In the [TIDAL developer dashboard](https://developer.tidal.com), register the redirect URI
-`http://localhost:3000/auth/callback` for your app and enable the scopes listed above.
-
-Other commands:
+Without `RENDER_API_KEY`/`WORKFLOW_SLUG` the web service runs the same task functions
+**inline**, in-process, with the same retry policy. That's convenient for development but
+has no durability across restarts. To exercise real workflow runs locally, use the Render CLI
+(v2.11+):
 
 ```bash
-npm test                                        # unit + end-to-end tests (no network needed)
-npm run inspect-export -- path/to/export.zip    # show what an export would import, no TIDAL calls
+render workflows dev -- node src/workflows/main.js     # local task server on :8120
+render workflows tasks list --local                    # in another terminal
+```
+
+Register `http://localhost:3000/auth/callback` as a redirect URI for your TIDAL app.
+
+Tests:
+
+```bash
+npm test          # everything; Postgres-backed tests are skipped without TEST_DATABASE_URL
+npm run test:db   # uses TEST_DATABASE_URL (default: local musicagg_test database)
+npm run inspect-export -- path/to/export.zip    # what an export would import, no TIDAL calls
 ```
 
 ## Deploying to Render
 
-`render.yaml` is a Render Blueprint for a single Node web service.
+1. **Blueprint** (`render.yaml`): Dashboard → **New → Blueprint** → this repo. This creates the
+   web service, the `music-agg-db` Postgres database and the `music-agg-shared` env group
+   (`DATABASE_URL` plus a generated `TOKEN_ENCRYPTION_KEY`). Enter `TIDAL_CLIENT_ID` when
+   prompted. You can leave `RENDER_API_KEY` and `WORKFLOW_SLUG` empty for now.
+2. **Workflow service.** Blueprints don't support these yet. Dashboard → **New → Workflow** →
+   same repo and branch, region **Oregon** (same as the database):
+   * Language: Node · Root directory: *(repo root)*
+   * Build command: `npm ci --omit=dev`
+   * Start command: `node src/workflows/main.js`
+   * Environment: link the **`music-agg-shared`** env group (or copy its `DATABASE_URL` and
+     `TOKEN_ENCRYPTION_KEY`), and add `TIDAL_CLIENT_ID`. Optional tuning:
+     `TIDAL_MIN_INTERVAL_MS`, `MATCH_CHUNK_SIZE`, `MATCH_PARALLELISM`.
+   * Deploy. The four tasks register automatically. Note the slug shown on a task's page
+     (`<slug>/matchImport`).
+3. **Connect the web service to it.** Set `WORKFLOW_SLUG` to that slug and `RENDER_API_KEY` to
+   an API key from Account settings → API keys, then redeploy the web service. `/api/me`
+   reports `workflowMode: "render"` once it's wired.
+4. **TIDAL redirect URI:** register `https://<web-service>.onrender.com/auth/callback`. For a
+   custom domain, register that domain's callback and set `TIDAL_REDIRECT_URI`.
 
-1. Render Dashboard → **New → Blueprint** → select this repo.
-2. Set `TIDAL_CLIENT_ID` when prompted. `SESSION_SECRET` is generated for you.
-3. After the first deploy, register `https://<your-service>.onrender.com/auth/callback` as a
-   redirect URI for your TIDAL app. If you use a custom domain, register that domain's
-   callback instead and set `TIDAL_REDIRECT_URI` to it.
-
-Sessions, uploads and jobs live **in memory**, so run a single instance. A restart or redeploy
-logs users out and drops any import that is in progress. The Blueprint uses the `starter`
-plan because free instances spin down when idle. To scale out, move `src/state.js` to Redis
-or Postgres.
+Both services must use the **same** `TOKEN_ENCRYPTION_KEY`, or tasks can't read the user's
+TIDAL tokens. If the Workflow service can't reach the database over the internal URL, give
+it the database's *external* connection string; TLS is detected automatically, or force it
+with `DATABASE_SSL=true`.
 
 ## Configuration
 
-| Variable                | Required | Default                                   | Notes |
-| ----------------------- | -------- | ----------------------------------------- | ----- |
-| `TIDAL_CLIENT_ID`       | yes      |                                           | From developer.tidal.com |
-| `SESSION_SECRET`        | prod     | random per process                        | Signs the session cookie |
-| `PUBLIC_BASE_URL`       | no       | `$RENDER_EXTERNAL_URL` or `http://localhost:$PORT` | |
-| `TIDAL_REDIRECT_URI`    | no       | `$PUBLIC_BASE_URL/auth/callback`          | Must match the TIDAL app config exactly |
-| `TIDAL_MIN_INTERVAL_MS` | no       | `200`                                     | Spacing between TIDAL calls per user |
-| `MAX_UPLOAD_MB`         | no       | `100`                                     | |
-| `PORT`                  | no       | `3000`                                    | Render sets this |
+| Variable | Used by | Required | Notes |
+| -------- | ------- | -------- | ----- |
+| `TIDAL_CLIENT_ID` | web, workflow | yes | From developer.tidal.com |
+| `DATABASE_URL` | web, workflow | yes | Same database for both |
+| `TOKEN_ENCRYPTION_KEY` | web, workflow | yes | Same value for both |
+| `SESSION_SECRET` | web | prod | Signs the session cookie |
+| `RENDER_API_KEY`, `WORKFLOW_SLUG` | web | prod | Start runs on Render Workflows (otherwise inline) |
+| `WORKFLOW_MODE` | web | no | Force `render` or `inline` |
+| `TIDAL_REDIRECT_URI` | web | no | Default `$PUBLIC_BASE_URL/auth/callback` |
+| `PUBLIC_BASE_URL` | web | no | Default `$RENDER_EXTERNAL_URL` or `http://localhost:$PORT` |
+| `TIDAL_MIN_INTERVAL_MS` | workflow | no | Spacing between TIDAL calls per run (default 200) |
+| `MATCH_CHUNK_SIZE` / `MATCH_PARALLELISM` | workflow | no | Default 100 / 2 |
+| `DATABASE_SSL` | both | no | Override TLS auto-detection |
+| `MAX_UPLOAD_MB` / `IMPORT_RETENTION_DAYS` | web | no | Default 100 / 30 |
 
 `TIDAL_CLIENT_SECRET` is **not** used: TIDAL's user-login (PKCE) flow needs only the client id.
 
@@ -125,7 +182,3 @@ or Postgres.
 To accept a new container type (for example `.tar.gz`), add a loader to `LOADERS` in
 `src/importers/bundle.js`. Zip uploads are read with streaming size limits, so declared sizes
 in a malicious archive are never trusted.
-
-Until a dedicated adapter exists, many exports already work through the generic CSV adapter.
-It recognises common column names such as `Title`/`Track Name`/`Name`,
-`Artist`/`Artist Name(s)`, `Album`, `ISRC` and `Duration (ms)`.

@@ -1,24 +1,52 @@
 # Render Blueprint: https://render.com/docs/blueprint-spec
-# Deploy: Render Dashboard → New → Blueprint → pick this repo.
+#
+# Creates the web service, its Postgres database, and an env group shared with the
+# Workflow service. Workflow services can't be declared in Blueprints yet, so create
+# that one in the Dashboard (see README → "Deploying to Render").
+databases:
+  - name: music-agg-db
+    plan: basic-256mb
+    region: oregon
+    databaseName: music_agg
+    user: music_agg
+
+envVarGroups:
+  # Link this group to the Workflow service too, so both read the same database and
+  # can decrypt the same stored TIDAL tokens.
+  - name: music-agg-shared
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: music-agg-db
+          property: connectionString
+      - key: TOKEN_ENCRYPTION_KEY
+        generateValue: true
+      - key: NODE_VERSION
+        value: "22"
+
 services:
   - type: web
     name: music-agg
     runtime: node
-    plan: starter # in-memory sessions/jobs: keep a single, always-on instance
+    region: oregon
+    plan: starter
     buildCommand: npm ci --omit=dev
     startCommand: npm start
     healthCheckPath: /healthz
-    autoDeploy: true
+    autoDeployTrigger: commit
     envVars:
-      - key: NODE_VERSION
-        value: "22"
+      - fromGroup: music-agg-shared
       - key: NODE_ENV
         value: production
-      - key: TIDAL_CLIENT_ID
-        sync: false # set in the dashboard (from developer.tidal.com → your app)
       - key: SESSION_SECRET
         generateValue: true
-      # Optional. Defaults to $RENDER_EXTERNAL_URL/auth/callback, which Render sets automatically.
-      # Set this if you use a custom domain; it must match a redirect URI registered with TIDAL.
+      - key: TIDAL_CLIENT_ID
+        sync: false # from developer.tidal.com → your app
+      - key: RENDER_API_KEY
+        sync: false # Account settings → API keys; lets the web service start workflow runs
+      - key: WORKFLOW_SLUG
+        sync: false # slug of the Workflow service, e.g. music-agg-workflows
+      # Optional. Defaults to $RENDER_EXTERNAL_URL/auth/callback (set by Render).
+      # Set it if you use a custom domain; it must match a redirect URI registered with TIDAL.
       - key: TIDAL_REDIRECT_URI
         sync: false

@@ -55,8 +55,10 @@ export async function enrichYouTubeTracks(tracks, { fetchImpl = fetch, concurren
         const url = `${OEMBED}?format=json&url=${encodeURIComponent(`https://www.youtube.com/watch?v=${track.source.id}`)}`;
         const res = await fetchImpl(url, { headers: { accept: 'application/json' }, signal: AbortSignal.timeout(10_000) });
         if (!res.ok) {
-          // 401/403/404: private, deleted or embed-disabled video.
-          track.lookupError = res.status === 404 || res.status === 401 || res.status === 403 ? 'Video is private or no longer available on YouTube' : `YouTube lookup failed (${res.status})`;
+          // 401/403/404: private, deleted or embed-disabled video — permanent.
+          const gone = res.status === 404 || res.status === 401 || res.status === 403 || res.status === 400;
+          track.lookupError = gone ? 'Video is private or no longer available on YouTube' : `YouTube lookup failed (${res.status})`;
+          track.lookupTransient = !gone;
           failed += 1;
         } else {
           const data = await res.json();
@@ -68,10 +70,13 @@ export async function enrichYouTubeTracks(tracks, { fetchImpl = fetch, concurren
           track.channel = data.author_name;
           track.needsLookup = !track.title;
           track.fromVideoTitle = true; // lower confidence: matcher will be stricter
+          delete track.lookupError;
+          delete track.lookupTransient;
           enriched += 1;
         }
       } catch (err) {
         track.lookupError = `YouTube lookup failed (${err.name === 'TimeoutError' ? 'timeout' : err.message})`;
+        track.lookupTransient = true;
         failed += 1;
       }
       onProgress?.(enriched + failed, pending.length);

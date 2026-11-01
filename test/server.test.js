@@ -1,27 +1,31 @@
-// End-to-end through the real Express app with a fake TIDAL + YouTube behind fetch.
+// End-to-end through the real Express app + Postgres, with workflow tasks run inline and a
+// fake TIDAL + YouTube behind fetch.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
+import { hasDb, testPool } from './helpers/db.js';
 
 process.env.TIDAL_CLIENT_ID = 'test-client';
 process.env.PUBLIC_BASE_URL = 'http://app.test';
+process.env.TOKEN_ENCRYPTION_KEY = 'test-key';
+process.env.DATABASE_URL = process.env.TEST_DATABASE_URL || 'postgresql://unused@localhost/unused';
 const { createApp } = await import('../src/server.js');
+const { buildDeps, setDeps } = await import('../src/workflows/deps.js');
+const { createInlineDispatcher } = await import('../src/workflows/dispatch.js');
 
 function fakeUpstream() {
   const log = [];
+  const state = { writeOutage: false, searchGate: null };
   const res = (body, status = 200) => new Response(JSON.stringify(body), { status });
   const fetchImpl = async (url, init = {}) => {
     const u = new URL(url);
-    log.push({ method: init.method || 'GET', url: u, body: init.body });
-    if (u.href === 'https://auth.tidal.com/v1/oauth2/token') {
-      return res({ access_token: 'AT', refresh_token: 'RT', expires_in: 86400, token_type: 'Bearer' });
-    }
-    if (u.hostname === 'www.youtube.com') {
-      return res({ title: 'Some Artist - Mystery Song (Official Video)', author_name: 'SomeArtistVEVO' });
-    }
+    log.push({ method: init.method || 'GET', url: u, body: init.body, headers: init.headers });
+    if (u.href === 'https://auth.tidal.com/v1/oauth2/token') return res({ access_token: 'AT', refresh_token: 'RT', expires_in: 86400 });
+    if (u.hostname === 'www.youtube.com') return res({ title: 'Some Artist - Mystery Song (Official Video)', author_name: 'SomeArtistVEVO' });
     if (u.hostname === 'openapi.tidal.com') {
       if (u.pathname === '/v2/users/me') return res({ data: { id: 'u1', type: 'users', attributes: { username: 'matt', country: 'US' } } });
       if (u.pathname === '/v2/searchResults') {
+        await state.searchGate;
         const q = u.searchParams.get('filter[query]');
         const title = q.includes('Angela') ? 'Angela' : q.includes('Quoted') ? 'Quoted, Title' : 'Mystery Song';
         const artist = q.includes('Angela') ? 'John Lennon' : q.includes('Quoted') ? 'Queens Of The Stone Age' : 'Some Artist';
@@ -34,21 +38,27 @@ function fakeUpstream() {
           ],
         });
       }
+      if (state.writeOutage && init.method === 'POST' && u.pathname.includes('/relationships/items')) return res({}, 503);
       if (u.pathname === '/v2/playlists') return res({ data: { id: 'PL', type: 'playlists', attributes: {} } }, 201);
-      if (u.pathname.endsWith('/relationships/items')) return res({});
+      if (u.pathname.endsWith('/relationships/items')) return res({ meta: { skipped: [] } });
     }
     return res({ errors: [{ detail: `unexpected ${u.href}` }] }, 404);
   };
-  return { fetchImpl, log };
+  return { fetchImpl, log, state };
 }
 
-async function startServer(fetchImpl) {
-  const server = createApp({ fetchImpl }).listen(0);
+async function startServer({ pool, dispatcher, fetchImpl }) {
+  const server = createApp({ pool, dispatcher, fetchImpl }).listen(0);
   await new Promise((r) => server.once('listening', r));
   const base = `http://127.0.0.1:${server.address().port}`;
   let cookie = '';
   const call = async (path, opts = {}) => {
-    const r = await fetch(base + path, { redirect: 'manual', ...opts, headers: { ...(opts.headers || {}), cookie } });
+    const headers = { ...(opts.headers || {}), cookie };
+    if (opts.json) {
+      headers['content-type'] = 'application/json';
+      opts = { ...opts, method: 'POST', body: JSON.stringify(opts.json) };
+    }
+    const r = await fetch(base + path, { redirect: 'manual', ...opts, headers });
     const set = r.headers.getSetCookie?.() || [];
     if (set.length) cookie = set.map((c) => c.split(';')[0]).join('; ');
     return r;
@@ -56,87 +66,86 @@ async function startServer(fetchImpl) {
   return { server, call };
 }
 
-async function poll(call, jobId) {
-  for (let i = 0; i < 200; i += 1) {
-    const job = await (await call(`/api/jobs/${jobId}`)).json();
-    if (job.status !== 'running') return job;
-    await new Promise((r) => setTimeout(r, 20));
-  }
-  throw new Error('job did not finish');
-}
+test('full flow: login → upload → match workflow → review → load workflow → retry', { skip: !hasDb }, async (t) => {
+  const db = await testPool();
+  const up = fakeUpstream();
+  setDeps(buildDeps({ pool: db.pool, fetchImpl: up.fetchImpl, settings: { chunkSize: 2, parallelism: 2, minIntervalMs: 0 }, clientOptions: { maxRetries: 0, sleepImpl: async () => {} } }));
+  const dispatcher = createInlineDispatcher({ waitScale: 0, log: {} });
+  const { server, call } = await startServer({ pool: db.pool, dispatcher, fetchImpl: up.fetchImpl });
+  t.after(async () => {
+    server.close();
+    await dispatcher.idle();
+    await db.close();
+  });
 
-test('full flow: login → upload → match → import', async (t) => {
-  const { fetchImpl, log } = fakeUpstream();
-  const { server, call } = await startServer(fetchImpl);
-  t.after(() => server.close());
-
-  // Not logged in yet.
   assert.equal((await (await call('/api/me')).json()).loggedIn, false);
   assert.equal((await call('/api/uploads', { method: 'POST' })).status, 401);
 
-  // Login redirects to TIDAL with PKCE.
+  // Login (PKCE) — a forged state is rejected, the real one logs in.
+  await call('/auth/login');
+  assert.match((await call('/auth/callback?code=abc&state=nope')).headers.get('location'), /authError/);
   const login = await call('/auth/login');
-  assert.equal(login.status, 302);
   const authUrl = new URL(login.headers.get('location'));
   assert.equal(authUrl.origin, 'https://login.tidal.com');
   assert.equal(authUrl.searchParams.get('redirect_uri'), 'http://app.test/auth/callback');
-  const state = authUrl.searchParams.get('state');
-
-  // A forged state is rejected.
-  const bad = await call(`/auth/callback?code=abc&state=nope`);
-  assert.match(bad.headers.get('location'), /authError/);
-
-  // Proper callback logs in. (State was consumed by the failed attempt, so log in again.)
-  const login2 = await call('/auth/login');
-  const state2 = new URL(login2.headers.get('location')).searchParams.get('state');
-  assert.notEqual(state2, state);
-  const cb = await call(`/auth/callback?code=abc&state=${state2}`);
+  const cb = await call(`/auth/callback?code=abc&state=${authUrl.searchParams.get('state')}`);
   assert.equal(cb.headers.get('location'), '/');
-  const tokenCall = log.find((l) => l.url.href === 'https://auth.tidal.com/v1/oauth2/token');
-  assert.equal(new URLSearchParams(tokenCall.body).get('grant_type'), 'authorization_code');
   const me = await (await call('/api/me')).json();
   assert.equal(me.loggedIn, true);
   assert.equal(me.user.username, 'matt');
+  assert.equal(me.workflowMode, 'inline');
+  const { rows } = await db.pool.query('SELECT tokens_enc FROM accounts');
+  assert.ok(!rows[0].tokens_enc.includes('AT'), 'tokens are encrypted at rest');
 
-  // Upload the fixture.
+  // Upload.
   const form = new FormData();
   form.append('file', new Blob([await readFile(new URL('./fixtures/youtube-takeout.zip', import.meta.url))]), 'export.zip');
-  const up = await (await call('/api/uploads', { method: 'POST', body: form })).json();
-  assert.equal(up.format, 'youtube-music');
-  assert.deepEqual(up.collections.map((c) => c.name), ['Library songs', 'Road Trip', 'Watch later']);
+  const up1 = await (await call('/api/uploads', { method: 'POST', body: form })).json();
+  assert.equal(up1.status, 'parsed');
+  assert.deepEqual(up1.collections.map((c) => c.name), ['Library songs', 'Road Trip', 'Watch later']);
 
-  // Match the library + Road Trip.
-  const matchStart = await call(`/api/uploads/${up.uploadId}/match`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ collectionIds: ['library-songs', 'playlist-0'] }),
-  });
-  assert.equal(matchStart.status, 202);
-  const match = await poll(call, (await matchStart.json()).id);
-  assert.equal(match.status, 'done', match.error);
-  assert.equal(match.result.stats.matched, 3, JSON.stringify(match.result.tracks, null, 1));
-  assert.ok(log.some((l) => l.url.hostname === 'www.youtube.com' && l.url.searchParams.get('url').includes('CCCCCCCCCCC')));
-  const searchCall = log.find((l) => l.url.pathname === '/v2/searchResults');
-  assert.equal(searchCall.url.searchParams.get('countryCode'), 'US');
+  // Match workflow. Hold TIDAL search so the run is still in progress for the double-start check.
+  let release;
+  up.state.searchGate = new Promise((r) => (release = r));
+  const started = await call(`/api/imports/${up1.id}/match`, { json: { collectionIds: ['library-songs', 'playlist-0'] } });
+  assert.equal(started.status, 202);
+  assert.equal((await call(`/api/imports/${up1.id}/match`, { json: { collectionIds: ['playlist-0'] } })).status, 409, 'no double start');
+  const midway = await (await call(`/api/imports/${up1.id}`)).json();
+  assert.equal(midway.status, 'matching');
+  assert.equal(midway.progress.total, 3);
+  release();
+  await dispatcher.idle();
+  const matched = await (await call(`/api/imports/${up1.id}?results=1`)).json();
+  assert.equal(matched.status, 'matched', matched.error);
+  assert.equal(matched.matchStats.matched, 3);
+  assert.equal(Object.keys(matched.results.tracks).length, 3);
+  assert.ok(up.log.some((l) => l.url.hostname === 'www.youtube.com' && l.url.searchParams.get('url').includes('CCCCCCCCCCC')));
 
-  // Import.
-  const importStart = await call('/api/imports', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ matchJobId: match.id, collections: [{ id: 'library-songs' }, { id: 'playlist-0', name: 'Road Trip (from YT)' }] }),
-  });
-  const imp = await poll(call, (await importStart.json()).id);
-  assert.equal(imp.status, 'done', imp.error);
-  assert.deepEqual(imp.result.collections.map((c) => [c.name, c.added]), [
-    ['Library songs', 2],
-    ['Road Trip (from YT)', 2],
+  // The import shows up in the user's list (resume after closing the tab).
+  const list = await (await call('/api/imports')).json();
+  assert.equal(list.imports[0].id, up1.id);
+
+  // Load workflow with a write outage that outlasts the task's retries → failed, resumable.
+  up.state.writeOutage = true;
+  const loadBody = { collections: [{ id: 'library-songs' }, { id: 'playlist-0', name: 'Road Trip (from YT)' }] };
+  assert.equal((await call(`/api/imports/${up1.id}/load`, { json: loadBody })).status, 202);
+  await dispatcher.idle();
+  const failed = await (await call(`/api/imports/${up1.id}`)).json();
+  assert.equal(failed.status, 'failed');
+  assert.match(failed.error, /Retry/);
+
+  // Re-matching after writes began is refused; Retry resumes instead.
+  assert.equal((await call(`/api/imports/${up1.id}/match`, { json: { collectionIds: ['playlist-0'] } })).status, 409);
+  up.state.writeOutage = false;
+  assert.equal((await call(`/api/imports/${up1.id}/retry`, { json: {} })).status, 202);
+  await dispatcher.idle();
+  const done = await (await call(`/api/imports/${up1.id}`)).json();
+  assert.equal(done.status, 'done', done.error);
+  assert.deepEqual(done.targets.map((x) => [x.name, x.status, x.added]), [
+    ['Library songs', 'done', 2],
+    ['Road Trip (from YT)', 'done', 2],
   ]);
-  const writes = log.filter((l) => l.method === 'POST' && l.url.hostname === 'openapi.tidal.com');
-  assert.deepEqual(writes.map((w) => w.url.pathname), [
-    '/v2/userCollectionTracks/me/relationships/items',
-    '/v2/playlists',
-    '/v2/playlists/PL/relationships/items',
-  ]);
-  const created = JSON.parse(writes[1].body);
-  assert.equal(created.data.attributes.name, 'Road Trip (from YT)');
+  assert.equal(done.targets[1].url, 'https://tidal.com/playlist/PL');
+  const creates = up.log.filter((l) => l.method === 'POST' && l.url.pathname === '/v2/playlists');
+  assert.equal(creates.length, 1, 'the playlist was created exactly once across the failure and retry');
 });

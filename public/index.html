@@ -38,6 +38,10 @@
           <summary>Supported formats</summary>
           <ul id="formats"></ul>
         </details>
+        <div id="recent" class="recent" hidden>
+          <h3>Recent imports</h3>
+          <ul id="recent-list"></ul>
+        </div>
       </section>
 
       <!-- 3. Choose collections -->
@@ -63,6 +67,14 @@
         <p id="progress-phase" class="muted"></p>
         <div class="bar"><div id="progress-bar"></div></div>
         <p id="progress-count" class="muted small"></p>
+        <p id="progress-note" class="muted small">This runs on our servers — you can close this page and come back later.</p>
+        <div id="progress-failed" class="failed" hidden>
+          <p id="progress-error"></p>
+          <div class="actions">
+            <button id="btn-home" class="button">Back</button>
+            <button id="btn-retry" class="button primary">Retry</button>
+          </div>
+        </div>
       </section>
 
       <!-- 4. Review -->

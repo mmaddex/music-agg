@@ -1,4 +1,6 @@
 // Front-end for the import flow: login → upload → choose → match → review → import.
+// Matching and importing run as Render Workflows; the page only starts them and polls the
+// import's stored status, so it can be closed and reopened at any time.
 // All user/track text is inserted with textContent (exports are untrusted input).
 
 const $ = (sel) => document.querySelector(sel);
@@ -6,14 +8,16 @@ const STEPS = ['login', 'upload', 'select', 'progress', 'review', 'done'];
 
 const state = {
   me: null,
-  upload: null, // response of POST /api/uploads
+  imp: null, // import view from the server
   names: {}, // collectionId -> playlist name on TIDAL
   selected: new Set(), // collectionIds
-  match: null, // match job result
-  matchJobId: null,
+  match: null, // { tracks, collections } for review
   decisions: {}, // trackKey -> tidal track id | null
   filter: 'all',
+  pollToken: 0,
 };
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const STATUS_LABEL = { parsed: 'Uploaded', matching: 'Matching…', matched: 'Ready to review', loading: 'Importing…', done: 'Done', failed: 'Needs attention' };
 
 function h(tag, attrs = {}, ...children) {
   const el = document.createElement(tag);
@@ -54,7 +58,6 @@ async function api(path, opts = {}) {
 const postJson = (path, data) =>
   api(path, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(data) });
 
-const fmtDuration = (ms) => (ms ? `${Math.floor(ms / 60000)}:${String(Math.round(ms / 1000) % 60).padStart(2, '0')}` : '');
 const describe = (c) => `${c.title}${c.version ? ` (${c.version})` : ''} — ${c.artists.join(', ')}${c.album ? ` · ${c.album}` : ''}`;
 
 // ---- account / login -------------------------------------------------------------
@@ -90,19 +93,26 @@ async function uploadFile(file) {
   const form = new FormData();
   form.append('file', file);
   try {
-    state.upload = await api('/api/uploads', { method: 'POST', body: form });
-    state.names = Object.fromEntries(state.upload.collections.map((c) => [c.id, c.name]));
-    state.selected = new Set(state.upload.collections.filter((c) => c.suggested && c.trackCount).map((c) => c.id));
-    renderSelect();
-    show('select');
+    openSelect(await api('/api/uploads', { method: 'POST', body: form }));
   } catch (err) {
     flash(err.message);
     show('upload');
   }
 }
 
+function openSelect(view) {
+  state.imp = view;
+  state.names = Object.fromEntries(view.collections.map((c) => [c.id, c.name]));
+  const previous = new Set(view.selected || []);
+  state.selected = new Set(
+    view.collections.filter((c) => (previous.size ? previous.has(c.id) : c.suggested) && c.trackCount).map((c) => c.id),
+  );
+  renderSelect();
+  show('select');
+}
+
 function renderSelect() {
-  const up = state.upload;
+  const up = state.imp;
   $('#detected').textContent = `${up.filename} · detected ${up.formatLabel}`;
   $('#warnings').replaceChildren(...up.warnings.map((w) => h('li', {}, w)));
   const rows = up.collections.map((c) => {
@@ -139,12 +149,12 @@ function renderSelect() {
 }
 
 function updateMatchButton() {
-  const n = state.upload.collections.filter((c) => state.selected.has(c.id)).reduce((a, c) => a + c.trackCount, 0);
+  const n = state.imp.collections.filter((c) => state.selected.has(c.id)).reduce((a, c) => a + c.trackCount, 0);
   $('#btn-match').disabled = !state.selected.size;
   $('#btn-match').textContent = state.selected.size ? `Find ${n} tracks on TIDAL` : 'Select something to import';
 }
 
-// ---- jobs -----------------------------------------------------------------------
+// ---- progress / polling -------------------------------------------------------------
 
 function setProgress(title, phase, done, total) {
   $('#progress-title').textContent = title;
@@ -153,13 +163,66 @@ function setProgress(title, phase, done, total) {
   $('#progress-count').textContent = total ? `${done} / ${total}` : '';
 }
 
-async function waitForJob(jobId, title) {
+function showFailed(view) {
+  show('progress');
+  $('#progress-title').textContent = view.stage === 'load' ? 'Import to TIDAL stopped' : 'Matching stopped';
+  $('#progress-failed').hidden = false;
+  $('#progress-note').hidden = true;
+  $('#progress-error').textContent = view.error || 'Something went wrong.';
+}
+
+/** Poll an import until it leaves matching/loading, then route to the right screen. */
+async function follow(importId) {
+  const token = ++state.pollToken;
+  $('#progress-failed').hidden = true;
+  $('#progress-note').hidden = false;
+  show('progress');
   for (;;) {
-    const job = await api(`/api/jobs/${jobId}`);
-    setProgress(title, job.phase, job.progress.done, job.progress.total);
-    if (job.status === 'done') return job.result;
-    if (job.status === 'failed') throw new Error(job.error || 'Job failed');
-    await new Promise((r) => setTimeout(r, 1000));
+    const view = await api(`/api/imports/${importId}`);
+    if (token !== state.pollToken) return; // superseded by another navigation
+    state.imp = view;
+    if (view.status !== 'matching' && view.status !== 'loading') return route(view);
+    const p = view.progress || {};
+    setProgress(view.status === 'loading' ? 'Importing to TIDAL' : 'Finding your music on TIDAL', p.phase, p.done || 0, p.total || 0);
+    await sleep(2000);
+  }
+}
+
+async function route(view) {
+  state.imp = view;
+  switch (view.status) {
+    case 'parsed':
+      return openSelect(view);
+    case 'matching':
+    case 'loading':
+      return follow(view.id);
+    case 'matched':
+      return openReview(view.id);
+    case 'done':
+      return showDone(view);
+    case 'failed':
+      return showFailed(view);
+    default:
+      return show('upload');
+  }
+}
+
+async function openImport(importId) {
+  flash('');
+  try {
+    await route(await api(`/api/imports/${importId}`));
+  } catch (err) {
+    flash(err.message);
+  }
+}
+
+async function retry() {
+  flash('');
+  try {
+    await postJson(`/api/imports/${state.imp.id}/retry`, {});
+    await follow(state.imp.id);
+  } catch (err) {
+    flash(err.message);
   }
 }
 
@@ -168,16 +231,37 @@ async function startMatch() {
   show('progress');
   setProgress('Finding your music on TIDAL', 'Starting…', 0, 0);
   try {
-    const job = await postJson(`/api/uploads/${state.upload.uploadId}/match`, { collectionIds: [...state.selected] });
-    state.matchJobId = job.id;
-    state.match = await waitForJob(job.id, 'Finding your music on TIDAL');
-    state.decisions = {};
-    renderReview();
-    show('review');
+    await postJson(`/api/imports/${state.imp.id}/match`, { collectionIds: [...state.selected] });
+    await follow(state.imp.id);
   } catch (err) {
     flash(err.message);
     show('select');
   }
+}
+
+async function openReview(importId) {
+  const view = await api(`/api/imports/${importId}?results=1`);
+  state.imp = view;
+  state.match = view.results;
+  state.decisions = {};
+  for (const c of view.collections) state.names[c.id] ??= c.name;
+  renderReview();
+  show('review');
+}
+
+async function loadRecent() {
+  const { imports } = await api('/api/imports');
+  $('#recent').hidden = !imports.length;
+  $('#recent-list').replaceChildren(
+    ...imports.map((i) =>
+      h(
+        'li',
+        {},
+        h('div', {}, h('div', {}, i.filename), h('div', { class: 'meta' }, `${STATUS_LABEL[i.status] || i.status} · ${new Date(i.created_at).toLocaleString()}`)),
+        h('button', { class: 'button', onclick: () => openImport(i.id) }, i.status === 'done' ? 'View' : 'Open'),
+      ),
+    ),
+  );
 }
 
 // ---- review ---------------------------------------------------------------------
@@ -189,7 +273,7 @@ function chosenId(key) {
 }
 
 function renderReview() {
-  const s = state.match.stats;
+  const s = state.imp.matchStats;
   $('#stats').replaceChildren(
     h('div', { class: 'stat' }, h('b', {}, s.matched), 'matched'),
     h('div', { class: 'stat' }, h('b', {}, s.review), 'need review'),
@@ -296,14 +380,20 @@ async function startImport() {
   show('progress');
   setProgress('Importing to TIDAL', 'Starting…', 0, 0);
   try {
-    const job = await postJson('/api/imports', {
-      matchJobId: state.matchJobId,
+    await postJson(`/api/imports/${state.imp.id}/load`, {
       collections: state.match.collections.map((c) => ({ id: c.id, name: state.names[c.id] || c.name })),
       decisions: state.decisions,
     });
-    const result = await waitForJob(job.id, 'Importing to TIDAL');
-    $('#done-list').replaceChildren(
-      ...result.collections.map((c) =>
+    await follow(state.imp.id);
+  } catch (err) {
+    flash(err.message);
+    show('review');
+  }
+}
+
+function showDone(view) {
+  $('#done-list').replaceChildren(
+      ...(view.targets || []).map((c) =>
         h(
           'li',
           {},
@@ -314,11 +404,7 @@ async function startImport() {
         ),
       ),
     );
-    show('done');
-  } catch (err) {
-    flash(err.message);
-    show('review');
-  }
+  show('done');
 }
 
 // ---- wiring ---------------------------------------------------------------------
@@ -341,12 +427,18 @@ function wire() {
   $('#btn-reupload').addEventListener('click', () => {
     input.value = '';
     show('upload');
+    loadRecent().catch(() => {});
   });
   $('#btn-import').addEventListener('click', startImport);
-  $('#btn-again').addEventListener('click', () => {
+  const home = () => {
+    state.pollToken += 1;
     input.value = '';
     show('upload');
-  });
+    loadRecent().catch(() => {});
+  };
+  $('#btn-again').addEventListener('click', home);
+  $('#btn-home').addEventListener('click', home);
+  $('#btn-retry').addEventListener('click', retry);
   document.querySelectorAll('.filters .chip[data-filter]').forEach((b) => b.addEventListener('click', () => setFilter(b.dataset.filter)));
   $('#btn-accept-review').addEventListener('click', acceptAllReview);
 }
@@ -358,6 +450,7 @@ async function init() {
   if (params.size) history.replaceState(null, '', '/');
   const me = await loadMe();
   show(me.loggedIn ? 'upload' : 'login');
+  if (me.loggedIn) await loadRecent().catch((err) => flash(err.message));
 }
 
 init();
