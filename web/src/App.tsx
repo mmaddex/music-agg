@@ -51,13 +51,16 @@ export function App() {
     if (!id) return;
     api
       .getUpload(id)
-      .then(({ summary, matches }) => {
+      .then(({ summary, matches, runningJob }) => {
         loadSummary(summary);
         if (matches.length) {
           setMatches(matches);
           setSelections(defaultSelections(matches));
           setStage('review');
         }
+        // Re-attach to a job that kept running on the server while the page was closed.
+        if (runningJob?.kind === 'match') followMatch(runningJob).catch(fail);
+        if (runningJob?.kind === 'import') followImport(runningJob).catch(fail);
       })
       .catch(() => sessionStorage.removeItem(STORAGE_KEY));
   }, [session?.user]);
@@ -92,21 +95,37 @@ export function App() {
     setError(null);
     const ids = summary.collections.filter((c) => choices[c.id]?.include).map((c) => c.id);
     try {
-      const started = await api.startMatch(summary.uploadId, ids);
-      setJob(started);
-      setStage('matching');
-      const done = await waitForJob<MatchJobResult>(started.id, setJob);
-      if (done.status === 'done' && done.result) {
-        setMatches(done.result.collections);
-        setSelections(defaultSelections(done.result.collections));
-        setStage('review');
-      } else {
-        if (done.status === 'failed') setError(done.error ?? 'Matching failed.');
-        setStage('choose');
-      }
+      await followMatch(await api.startMatch(summary.uploadId, ids));
     } catch (e) {
       fail(e);
       setStage('choose');
+    }
+  }
+
+  async function followMatch(started: JobView) {
+    setJob(started);
+    setStage('matching');
+    const done = await waitForJob<MatchJobResult>(started.id, setJob);
+    if (done.status === 'done' && done.result) {
+      setMatches(done.result.collections);
+      setSelections(defaultSelections(done.result.collections));
+      setStage('review');
+    } else {
+      if (done.status === 'failed') setError(done.error ?? 'Matching failed.');
+      setStage('choose');
+    }
+  }
+
+  async function followImport(started: JobView) {
+    setJob(started);
+    setStage('importing');
+    const done = await waitForJob<ImportJobResult>(started.id, setJob);
+    if (done.status === 'done' && done.result) {
+      setResult(done.result);
+      setStage('done');
+    } else {
+      if (done.status === 'failed') setError(done.error ?? 'Import failed.');
+      setStage('review');
     }
   }
 
@@ -133,17 +152,7 @@ export function App() {
       return;
     }
     try {
-      const started = await api.startImport(summary.uploadId, plan);
-      setJob(started);
-      setStage('importing');
-      const done = await waitForJob<ImportJobResult>(started.id, setJob);
-      if (done.status === 'done' && done.result) {
-        setResult(done.result);
-        setStage('done');
-      } else {
-        if (done.status === 'failed') setError(done.error ?? 'Import failed.');
-        setStage('review');
-      }
+      await followImport(await api.startImport(summary.uploadId, plan));
     } catch (e) {
       fail(e);
       setStage('review');

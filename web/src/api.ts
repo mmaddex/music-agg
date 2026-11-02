@@ -50,7 +50,9 @@ export const api = {
     return call<UploadSummary>('/api/uploads', { method: 'POST', body: form });
   },
   getUpload: (id: string) =>
-    call<{ summary: UploadSummary; matches: CollectionMatchView[] }>(`/api/uploads/${encodeURIComponent(id)}`),
+    call<{ summary: UploadSummary; matches: CollectionMatchView[]; runningJob: JobView | null }>(
+      `/api/uploads/${encodeURIComponent(id)}`,
+    ),
 
   startMatch: (uploadId: string, collectionIds: string[]) =>
     call<JobView<MatchJobResult>>(`/api/uploads/${encodeURIComponent(uploadId)}/match`, json({ collectionIds })),

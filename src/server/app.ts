@@ -117,8 +117,14 @@ export function createApp({ config, fetch: fetchImpl = fetch, staticDir, tidalCl
   });
 
   app.get('/api/uploads/:id', auth, (req, res) => {
-    const u = getUpload(req.session!, String(req.params.id));
-    res.json({ summary: summarize(u), matches: u.matches ? [...u.matches.values()] : [] });
+    const s = req.session!;
+    const u = getUpload(s, String(req.params.id));
+    const running = [...s.jobs.values()].find((j) => j.uploadId === u.id && j.status === 'running');
+    res.json({
+      summary: summarize(u),
+      matches: u.matches ? [...u.matches.values()] : [],
+      runningJob: running ? jobView(running) : null,
+    });
   });
 
   app.delete('/api/uploads/:id', auth, (req, res) => {
