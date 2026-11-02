@@ -3,6 +3,8 @@ import type { JobView } from '../../../src/shared/api.ts';
 export function JobProgress({ job, title, onCancel }: { job: JobView; title: string; onCancel: () => void }) {
   const pct = job.total > 0 ? Math.min(100, Math.round((job.done / job.total) * 100)) : null;
   const elapsed = Math.round((Date.now() - job.startedAt) / 1000);
+  const phaseSecs = (Date.now() - job.phaseStartedAt) / 1000;
+  const remaining = job.done >= 10 && job.total > job.done ? ((job.total - job.done) * phaseSecs) / job.done : null;
   return (
     <section className="card">
       <h2>{title}</h2>
@@ -19,7 +21,10 @@ export function JobProgress({ job, title, onCancel }: { job: JobView; title: str
         <div className={pct === null ? 'bar indeterminate' : 'bar'} style={pct === null ? undefined : { width: `${pct}%` }} />
       </div>
       <div className="row">
-        <span className="muted small">{elapsed}s elapsed. You can leave this tab open in the background.</span>
+        <span className="muted small">
+          {formatSecs(elapsed)} elapsed{remaining !== null && <>, about {formatSecs(remaining)} left</>}. You can leave
+          this tab open in the background.
+        </span>
         <div className="spacer" />
         <button className="secondary" onClick={onCancel} disabled={job.status !== 'running'}>
           Cancel
@@ -27,4 +32,9 @@ export function JobProgress({ job, title, onCancel }: { job: JobView; title: str
       </div>
     </section>
   );
+}
+
+function formatSecs(s: number) {
+  const m = Math.floor(s / 60);
+  return m ? `${m} min ${Math.round(s % 60)}s` : `${Math.round(s)}s`;
 }

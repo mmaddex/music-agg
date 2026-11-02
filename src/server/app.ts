@@ -6,7 +6,7 @@ import type { AppConfig } from '../config.js';
 import { BundleError } from '../core/bundle/bundle.js';
 import { IMPORTERS, UnsupportedExportError } from '../core/importers/registry.js';
 import { TidalAuthError, TokenManager, buildAuthorizeUrl, createPkcePair, createState, exchangeCode } from '../core/tidal/auth.js';
-import { TidalApiError, TidalClient } from '../core/tidal/client.js';
+import { TidalApiError, TidalClient, type TidalClientOptions } from '../core/tidal/client.js';
 import type { SessionView } from '../shared/api.js';
 import { jobView, startJob } from './jobs.js';
 import { createUpload, runImport, runMatch, summarize, validatePlan } from './pipeline.js';
@@ -18,9 +18,11 @@ export interface AppOptions {
   fetch?: typeof fetch;
   /** Directory with the built web client (served in production). */
   staticDir?: string;
+  /** Extra TIDAL client options (e.g. pacing in tests). */
+  tidalClient?: Partial<TidalClientOptions>;
 }
 
-export function createApp({ config, fetch: fetchImpl = fetch, staticDir }: AppOptions) {
+export function createApp({ config, fetch: fetchImpl = fetch, staticDir, tidalClient }: AppOptions) {
   const app = express();
   const store = new SessionStore(config.sessionTtlMs, config.secureCookies);
   const auth = requireUser(store);
@@ -65,7 +67,7 @@ export function createApp({ config, fetch: fetchImpl = fetch, staticDir }: AppOp
     try {
       const tokens = await exchangeCode(config.tidal, code, verifier, fetchImpl);
       const manager = new TokenManager(config.tidal, tokens, (t) => (s.tokens = t), fetchImpl);
-      const client = new TidalClient(manager, { baseUrl: config.tidal.apiBaseUrl, fetch: fetchImpl });
+      const client = new TidalClient(manager, { ...tidalClient, baseUrl: config.tidal.apiBaseUrl, fetch: fetchImpl });
       const user = await client.getMe();
       client.countryCode = user.country;
       s.tokens = tokens;

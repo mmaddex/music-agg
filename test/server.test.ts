@@ -63,7 +63,7 @@ beforeAll(async () => {
     TIDAL_CLIENT_ID: 'client-abc',
     TIDAL_REDIRECT_URI: 'http://localhost:5173/auth/callback',
   } as NodeJS.ProcessEnv);
-  const { app } = createApp({ config, fetch: routedFetch });
+  const { app } = createApp({ config, fetch: routedFetch, tidalClient: { initialIntervalMs: 0, minIntervalMs: 0 } });
   server = app.listen(0);
   await new Promise((r) => server.once('listening', r));
   base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;

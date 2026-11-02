@@ -113,6 +113,7 @@ export interface JobView<R = unknown> {
   done: number;
   total: number;
   startedAt: number;
+  phaseStartedAt: number;
   finishedAt?: number;
   error?: string;
   result?: R;

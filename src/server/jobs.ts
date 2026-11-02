@@ -11,6 +11,8 @@ export interface Job<R = unknown> {
   done: number;
   total: number;
   startedAt: number;
+  /** When the current phase began (for ETA estimates). */
+  phaseStartedAt: number;
   finishedAt?: number;
   error?: string;
   result?: R;
@@ -41,6 +43,7 @@ export function startJob<R>(
     done: 0,
     total: 0,
     startedAt: Date.now(),
+    phaseStartedAt: Date.now(),
     abort: new AbortController(),
   };
   jobs.set(job.id, job as Job);
@@ -49,6 +52,7 @@ export function startJob<R>(
     signal: job.abort.signal,
     setPhase(phase, total) {
       job.phase = phase;
+      job.phaseStartedAt = Date.now();
       job.done = 0;
       if (total !== undefined) job.total = total;
     },
@@ -86,6 +90,7 @@ export function jobView(job: Job) {
     done: job.done,
     total: job.total,
     startedAt: job.startedAt,
+    phaseStartedAt: job.phaseStartedAt,
     finishedAt: job.finishedAt,
     error: job.error,
     result: job.status === 'done' ? job.result : undefined,

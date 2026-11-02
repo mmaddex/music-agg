@@ -85,8 +85,15 @@ export class TidalApiError extends Error {
 export interface TidalClientOptions {
   baseUrl?: string;
   countryCode?: string;
-  /** Max concurrent requests. TIDAL rate-limits per client; 429s are handled with backoff. */
+  /** Max concurrent requests. */
   concurrency?: number;
+  /**
+   * Starting gap between request starts, in ms. TIDAL doesn't publish its rate
+   * limit or send rate-limit headers, so the client adapts: the gap widens on
+   * every 429 and slowly narrows again while requests succeed.
+   */
+  initialIntervalMs?: number;
+  minIntervalMs?: number;
   maxRetries?: number;
   fetch?: typeof fetch;
 }
@@ -101,6 +108,13 @@ export class TidalClient {
   private readonly fetchImpl: typeof fetch;
   /** When TIDAL says slow down, every request waits until this time. */
   private pausedUntil = 0;
+  /** Adaptive pacing (AIMD): gap between request starts. */
+  private interval: number;
+  private readonly minInterval: number;
+  private nextSlot = 0;
+  private lastSlowdown = 0;
+  /** Counters, useful for logging/diagnostics. */
+  readonly stats = { requests: 0, rateLimited: 0 };
   private readonly trackCache = new Map<string, TidalTrack>();
   private nestedSearchInclude: boolean | undefined;
   countryCode: string;
@@ -114,6 +128,37 @@ export class TidalClient {
     this.limit = createLimiter(opts.concurrency ?? 4);
     this.maxRetries = opts.maxRetries ?? 6;
     this.fetchImpl = opts.fetch ?? fetch;
+    this.minInterval = opts.minIntervalMs ?? 50;
+    this.interval = opts.initialIntervalMs ?? 150;
+  }
+
+  /** Current gap between requests (ms). */
+  get pacingIntervalMs() {
+    return Math.round(this.interval);
+  }
+
+  /** Wait for this request's turn, keeping `interval` ms between request starts. */
+  private async pace(signal?: AbortSignal) {
+    const now = Date.now();
+    const start = Math.max(now, this.nextSlot, this.pausedUntil);
+    this.nextSlot = start + this.interval;
+    if (start > now) await sleep(start - now, signal);
+  }
+
+  private onRateLimited(delayMs: number) {
+    this.stats.rateLimited++;
+    const now = Date.now();
+    this.pausedUntil = Math.max(this.pausedUntil, now + delayMs);
+    this.nextSlot = Math.max(this.nextSlot, this.pausedUntil);
+    // Several in-flight requests usually hit the limit together; slow down once per burst.
+    if (now - this.lastSlowdown > 2000) {
+      this.lastSlowdown = now;
+      this.interval = Math.min(5000, Math.max(this.interval * 1.6, this.minInterval * 2));
+    }
+  }
+
+  private onSuccess() {
+    this.interval = Math.max(this.minInterval, this.interval * 0.99);
   }
 
   // ---------------------------------------------------------------- transport
@@ -144,9 +189,9 @@ export class TidalClient {
     return this.limit(async () => {
       let refreshed = false;
       for (let attempt = 0; ; attempt++) {
-        const wait = this.pausedUntil - Date.now();
-        if (wait > 0) await sleep(wait, opts.signal);
+        await this.pace(opts.signal);
         const token = await this.tokens.getAccessToken();
+        this.stats.requests++;
         let res: Response;
         try {
           res = await this.fetchImpl(url, {
@@ -174,12 +219,13 @@ export class TidalClient {
         if ((res.status === 429 || res.status >= 500) && retryable && attempt < this.maxRetries) {
           const retryAfter = parseRetryAfter(res.headers.get('retry-after'));
           const delay = retryAfter ?? backoff(attempt);
-          if (res.status === 429) this.pausedUntil = Math.max(this.pausedUntil, Date.now() + delay);
           await res.body?.cancel();
-          await sleep(delay, opts.signal);
+          if (res.status === 429) this.onRateLimited(delay);
+          else await sleep(delay, opts.signal);
           continue;
         }
 
+        if (res.ok) this.onSuccess();
         const text = await res.text();
         const json = text ? safeJson(text) : undefined;
         if (!res.ok) {

@@ -21,7 +21,7 @@ const CATALOG: FakeTrack[] = [
 
 function client(fake: ReturnType<typeof createFakeTidal>, tokens = { accessToken: 'access-0', refreshToken: 'refresh-0', expiresAt: Date.now() + 3600_000 }) {
   const manager = new TokenManager(oauth, tokens, undefined, fake.fetch);
-  return new TidalClient(manager, { fetch: fake.fetch, countryCode: 'NO', maxRetries: 3 });
+  return new TidalClient(manager, { fetch: fake.fetch, countryCode: 'NO', maxRetries: 3, initialIntervalMs: 0, minIntervalMs: 0 });
 }
 
 describe('OAuth', () => {
@@ -121,6 +121,19 @@ describe('TidalClient', () => {
     const r = await client(fake).searchTracks('kodachrome');
     expect(r).toHaveLength(1);
     expect(fake.requests).toHaveLength(3);
+  });
+
+  it('slows down after a 429 and speeds back up as requests succeed', async () => {
+    const fake = createFakeTidal(CATALOG, { nestedInclude: true });
+    const manager = new TokenManager(oauth, { accessToken: 'a', refreshToken: 'r', expiresAt: Date.now() + 3600_000 }, undefined, fake.fetch);
+    const c = new TidalClient(manager, { fetch: fake.fetch, initialIntervalMs: 10, minIntervalMs: 10 });
+    fake.failNext(() => true, () => jsonResponse(429, {}, { 'retry-after': '0' }), 1);
+    await c.searchTracks('kodachrome');
+    const slowed = c.pacingIntervalMs;
+    expect(slowed).toBeGreaterThan(10);
+    expect(c.stats).toEqual({ requests: 2, rateLimited: 1 });
+    for (let i = 0; i < 5; i++) await c.getMe();
+    expect(c.pacingIntervalMs).toBeLessThan(slowed);
   });
 
   it('refreshes the token once on 401', async () => {

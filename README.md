@@ -140,8 +140,10 @@ Base URL `https://openapi.tidal.com/v2` (JSON:API, `application/vnd.api+json`):
 | Add to playlist | `POST /playlists/{id}/relationships/items` (≤ 50 per call) |
 | Add to favourites | `POST /userCollectionTracks/me/relationships/items` (≤ 50 per call) |
 
-Requests run with bounded concurrency. `429`/`5xx` are retried with backoff that honours `Retry-After`, and every
-write carries an `Idempotency-Key`, so retries never add a track twice. Expired tokens are refreshed automatically.
+TIDAL doesn't publish its rate limit or send rate-limit headers, so requests are **paced adaptively**. The gap
+between requests widens on every `429` (honouring `Retry-After`) and narrows again while requests succeed. `5xx`
+responses are retried with backoff. Every write carries an `Idempotency-Key`, so retries never add a track twice.
+Expired tokens are refreshed automatically.
 
 ## Privacy and TIDAL developer terms
 

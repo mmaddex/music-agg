@@ -126,7 +126,8 @@ export function ChooseStep(props: {
             `${lookups} entries only have a YouTube video id and will be looked up on YouTube first${
               props.youtubeApiKey ? '' : ' (about 1–2 minutes per 500)'
             }. `}
-          Nothing is written to TIDAL until you review the matches.
+          TIDAL limits how fast apps can search (roughly 2 songs a second), so large libraries take a while — about{' '}
+          {Math.max(1, Math.round(tracks / 110))} min here. Nothing is written to TIDAL until you review the matches.
         </p>
         <div className="spacer" />
         <button className="primary" disabled={!selected.length} onClick={props.onMatch}>
