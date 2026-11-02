@@ -11,14 +11,11 @@ databases:
     user: music_agg
 
 envVarGroups:
-  # Link this group to the Workflow service too, so both read the same database and
-  # can decrypt the same stored TIDAL tokens.
+  # Link this group to the Workflow service too, so both can decrypt the same stored
+  # TIDAL tokens. (Env groups can't reference databases, so DATABASE_URL is set per
+  # service: below for the web service, by hand for the Workflow service.)
   - name: music-agg-shared
     envVars:
-      - key: DATABASE_URL
-        fromDatabase:
-          name: music-agg-db
-          property: connectionString
       - key: TOKEN_ENCRYPTION_KEY
         generateValue: true
       - key: NODE_VERSION
@@ -36,6 +33,10 @@ services:
     autoDeployTrigger: commit
     envVars:
       - fromGroup: music-agg-shared
+      - key: DATABASE_URL
+        fromDatabase:
+          name: music-agg-db
+          property: connectionString
       - key: NODE_ENV
         value: production
       - key: SESSION_SECRET

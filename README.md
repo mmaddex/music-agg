@@ -122,15 +122,17 @@ npm run inspect-export -- path/to/export.zip    # what an export would import, n
 
 1. **Blueprint** (`render.yaml`): Dashboard → **New → Blueprint** → this repo. This creates the
    web service, the `music-agg-db` Postgres database and the `music-agg-shared` env group
-   (`DATABASE_URL` plus a generated `TOKEN_ENCRYPTION_KEY`). Enter `TIDAL_CLIENT_ID` when
-   prompted. You can leave `RENDER_API_KEY` and `WORKFLOW_SLUG` empty for now.
+   (a generated `TOKEN_ENCRYPTION_KEY`). The web service gets `DATABASE_URL` from the database
+   directly. Enter `TIDAL_CLIENT_ID` when prompted. You can leave `RENDER_API_KEY` and
+   `WORKFLOW_SLUG` empty for now.
 2. **Workflow service.** Blueprints don't support these yet. Dashboard → **New → Workflow** →
    same repo and branch, region **Oregon** (same as the database):
    * Language: Node · Root directory: *(repo root)*
    * Build command: `npm ci --omit=dev`
    * Start command: `node src/workflows/main.js`
-   * Environment: link the **`music-agg-shared`** env group (or copy its `DATABASE_URL` and
-     `TOKEN_ENCRYPTION_KEY`), and add `TIDAL_CLIENT_ID`. Optional tuning:
+   * Environment: link the **`music-agg-shared`** env group (or copy its
+     `TOKEN_ENCRYPTION_KEY`). Add `DATABASE_URL` with the database's **Internal Database URL**
+     (database page → Connect), and `TIDAL_CLIENT_ID`. Optional tuning:
      `TIDAL_MIN_INTERVAL_MS`, `MATCH_CHUNK_SIZE`, `MATCH_PARALLELISM`.
    * Deploy. The four tasks register automatically. Note the slug shown on a task's page
      (`<slug>/matchImport`).
