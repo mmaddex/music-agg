@@ -123,10 +123,11 @@ npm run inspect-export -- path/to/export.zip    # what an export would import, n
 
 `render.yaml` defines everything: the web service, the **Workflow service**
 (`music-agg-workflows`), the `music-agg-db` Postgres database, and the `music-agg-shared` env
-group. The env group holds a generated `TOKEN_ENCRYPTION_KEY` that both services share.
+group. Both services link the env group, which holds `TIDAL_CLIENT_ID` and a generated
+`TOKEN_ENCRYPTION_KEY`. To use a different TIDAL app, change `TIDAL_CLIENT_ID` in
+`render.yaml`, or in the env group in the Dashboard.
 
 1. Dashboard → **New → Blueprint** → this repo. When prompted, enter:
-   * `TIDAL_CLIENT_ID` on **both** services (same value)
    * `RENDER_API_KEY` on the web service (Account settings → API keys), so it can start runs
    * `TIDAL_REDIRECT_URI` only if you use a custom domain; otherwise leave it blank
 2. The web service gets `DATABASE_URL` and `WORKFLOW_SLUG` automatically (`fromDatabase` /

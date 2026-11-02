@@ -10,9 +10,14 @@ databases:
     user: music_agg
 
 envVarGroups:
-  # Shared by the web and Workflow services: both must decrypt the same stored TIDAL tokens.
+  # Shared by the web and Workflow services.
   - name: music-agg-shared
     envVars:
+      # TIDAL app (developer.tidal.com). Not a secret: it appears in every login URL. Used by
+      # the web service for login and by the workflow tasks to refresh tokens.
+      - key: TIDAL_CLIENT_ID
+        value: 3yg0AqbboDf4MT9r
+      # Both services must decrypt the same stored TIDAL tokens.
       - key: TOKEN_ENCRYPTION_KEY
         generateValue: true
       - key: NODE_VERSION
@@ -46,8 +51,6 @@ services:
         value: production
       - key: SESSION_SECRET
         generateValue: true
-      - key: TIDAL_CLIENT_ID
-        sync: false # from developer.tidal.com → your app
       # Optional. Defaults to $RENDER_EXTERNAL_URL/auth/callback (set by Render).
       # Set it if you use a custom domain; it must match a redirect URI registered with TIDAL.
       - key: TIDAL_REDIRECT_URI
@@ -67,8 +70,6 @@ services:
         fromDatabase:
           name: music-agg-db
           property: connectionString
-      - key: TIDAL_CLIENT_ID
-        sync: false # same value as the web service; used to refresh TIDAL tokens
       # Optional tuning:
       # - key: TIDAL_MIN_INTERVAL_MS   # spacing between TIDAL calls per run (default 200)
       # - key: MATCH_CHUNK_SIZE        # tracks per matchChunk run (default 100)
