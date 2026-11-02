@@ -78,3 +78,10 @@ describe('YouTube enrichers', () => {
     expect(tracks[1]!.hints?.nonMusic).toBe('1');
   });
 });
+
+describe('Unicode', () => {
+  it('strips a channel-name suffix even when the accents are encoded differently', () => {
+    const nfdTitle = 'Dominguinhos - Minhas Desculpas (Forró Stream)';
+    expect(parseVideoTitle(nfdTitle, 'Forró Stream')).toMatchObject({ artist: 'Dominguinhos', title: 'Minhas Desculpas' });
+  });
+});

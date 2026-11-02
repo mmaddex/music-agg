@@ -27,7 +27,9 @@ function remember(id: string, r: VideoLookupResult) {
   cache.set(id, r);
 }
 
-export function applyVideoInfo(track: SourceTrack, info: VideoInfo) {
+export function applyVideoInfo(track: SourceTrack, raw: VideoInfo) {
+  // YouTube mixes Unicode forms (e.g. decomposed "ó" in titles, precomposed in channel names).
+  const info = { ...raw, title: raw.title.normalize('NFC'), channel: raw.channel?.normalize('NFC') };
   const parsed = parseVideoTitle(info.title, info.channel);
   track.title = parsed.title || info.title;
   track.artists = parsed.artist ? [parsed.artist] : [];

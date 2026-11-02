@@ -54,7 +54,18 @@ export function normalizeTitle(title: string): { core: string; qualifiers: strin
       t = t.slice(0, dash.index);
     }
   }
-  return { core: basicNormalize(t), qualifiers: qualifiers.filter(Boolean) };
+  let core = basicNormalize(t);
+  // Titles that are entirely bracketed, e.g. M. Ward's "[More Rain]".
+  if (!core) core = basicNormalize(stripFeaturing(title));
+  return { core, qualifiers: qualifiers.filter(Boolean) };
+}
+
+/** Remove "(2009 Remaster)" / "- Remastered 2010" style parts (keeps everything else verbatim). */
+export function stripVersionNoise(title: string): string {
+  return title
+    .replace(/\s*[([]([^)\]]*)[)\]]/g, (whole, inner: string) => (VERSION_NOISE.test(inner) ? ' ' : whole))
+    .replace(/\s+[-–—]\s+([^-–—]+)$/, (whole, tail: string) => (VERSION_NOISE.test(tail) ? '' : whole))
+    .trim();
 }
 
 const ARTIST_NOISE = /^(the)\s+/;
@@ -75,12 +86,25 @@ export function splitArtists(a: string): string[] {
     .filter(Boolean);
 }
 
-/** Text to send to TIDAL search: no brackets/featuring noise, keep words. */
-export function searchText(s: string): string {
-  return stripFeaturing(s)
-    .replace(/\s*[([][^)\]]*[)\]]/g, ' ')
-    .replace(/\s+[-–—]\s+(.*\b(remaster(ed)?|live|version|edit|mix)\b.*)$/i, ' ')
-    .replace(/["“”]/g, '')
-    .replace(/\s+/g, ' ')
-    .trim();
+const SEARCH_NOISE = /\b(remaster(ed)?|deluxe|bonus track|mono|stereo|single version|album version|official|video|audio|lyrics?|explicit|clean)\b/i;
+
+function tidy(s: string): string {
+  return s.replace(/["“”]/g, '').replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * Text to send to TIDAL search.
+ *  - `keepQualifiers: false` (default): drop every bracketed part — "Bloodbuzz Ohio (Live…)" -> "Bloodbuzz Ohio".
+ *  - `keepQualifiers: true`: drop only noise like "(2009 Remaster)" and keep meaningful parts,
+ *    so "Wilco (The Song)" stays searchable as "Wilco The Song".
+ * Never returns an empty string for a non-empty title ("[More Rain]" -> "More Rain").
+ */
+export function searchText(s: string, opts: { keepQualifiers?: boolean } = {}): string {
+  const base = stripFeaturing(s.normalize('NFC'));
+  let out = base.replace(/\s*[([]([^)\]]*)[)\]]/g, (_, inner: string) =>
+    opts.keepQualifiers && !SEARCH_NOISE.test(inner) ? ` ${inner} ` : ' ',
+  );
+  if (!opts.keepQualifiers) out = out.replace(/\s+[-–—]\s+(.*\b(remaster(ed)?|live|version|edit|mix)\b.*)$/i, ' ');
+  out = tidy(out);
+  return out || tidy(base.replace(/[()[\]]/g, ' '));
 }

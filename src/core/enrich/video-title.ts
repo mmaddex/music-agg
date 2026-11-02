@@ -20,13 +20,16 @@ const NOISE_WORDS =
 
 const DASH_SEPARATOR = /\s+[-–—~]\s+/;
 
+/** Case/accent-insensitive comparison key ("Forró" in NFC vs NFD must compare equal). */
+const fold = (s: string) => s.normalize('NFKD').replace(/\p{M}+/gu, '').toLowerCase().trim();
+
 function stripNoise(title: string, channel?: string): string {
   let t = title;
   // Bracketed segments that are noise or just repeat the channel name.
   t = t.replace(/\s*[([【「]([^)\]】」]*)[)\]】」]/g, (whole, inner: string) => {
     const s = inner.trim();
     if (NOISE_WORDS.test(s)) return '';
-    if (channel && s.toLowerCase() === channel.toLowerCase()) return '';
+    if (channel && fold(s) === fold(channel)) return '';
     return whole;
   });
   // Trailing "| Channel | Show" segments.

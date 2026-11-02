@@ -1,6 +1,6 @@
 import type { SourceTrack } from '../model.js';
 import type { TidalTrack } from '../tidal/client.js';
-import { normalizeArtist, normalizeTitle, searchText, splitArtists, basicNormalize } from './normalize.js';
+import { normalizeArtist, normalizeTitle, searchText, splitArtists, basicNormalize, stripVersionNoise } from './normalize.js';
 import { similarity } from './similarity.js';
 
 /** What the matcher needs from TIDAL. `TidalClient` implements it; tests use a fake. */
@@ -36,6 +36,19 @@ export const THRESHOLDS = {
 
 const SPECIAL_VERSIONS = ['live', 'acoustic', 'remix', 'instrumental', 'demo', 'karaoke', 'unplugged', 'cover'];
 const IMPOSTOR = /\b(karaoke|tribute|made famous by|originally performed|in the style of|cover version|8 ?bit|lullaby renditions?)\b/i;
+
+/**
+ * Numbers and movement numerals that identify *which* piece/part a title is:
+ * "Divertimento in F, K. 138: I. Allegro" -> { "138", "mvt:i" }. Roman numerals only
+ * count when they look like a movement marker ("II." / "IV:"), not the word "I".
+ */
+export function identifyingNumbers(title: string): Set<string> {
+  const out = new Set<string>();
+  const t = title.normalize('NFC');
+  for (const m of t.matchAll(/(?:^|[\s:;,(\[-])([IVX]{1,5})[.:)](?=\s|$)/g)) out.add(`mvt:${m[1]!.toLowerCase()}`);
+  for (const m of t.matchAll(/\d+/g)) out.add(String(Number(m[0])));
+  return out;
+}
 
 function specialTags(parts: string[]): Set<string> {
   const tags = new Set<string>();
@@ -90,10 +103,26 @@ export function scoreCandidate(source: SourceTrack, cand: TidalTrack): ScoredCan
     titleScore *= 0.9;
   }
 
-  // Karaoke/tribute versions that would otherwise look like perfect matches.
-  const candText = `${cand.title} ${cand.version ?? ''} ${cand.artists.join(' ')} ${cand.album ?? ''}`;
+  // Different movement / number of the same work: "…: I. Allegro" vs "…: II. Andante",
+  // "Symphony No. 3" vs "Symphony No. 5". Long shared prefixes make these look similar.
+  const srcNums = identifyingNumbers(stripVersionNoise(source.title ?? ''));
+  if (srcNums.size) {
+    const candNums = identifyingNumbers(stripVersionNoise(cand.version ? `${cand.title} (${cand.version})` : cand.title));
+    const missing = [...srcNums].filter((n) => !candNums.has(n));
+    const conflictingMovement =
+      [...srcNums].some((n) => n.startsWith('mvt:')) && [...candNums].some((n) => n.startsWith('mvt:') && !srcNums.has(n));
+    if (missing.length || conflictingMovement) {
+      score *= 0.7;
+      titleScore *= 0.7;
+    }
+  }
+
+  // Karaoke/tribute versions that would otherwise look like perfect matches. Album
+  // names are ignored (Molly Sarlé's album is literally called "Karaoke Angel"), and a
+  // strong artist match means it's the real artist, not a cover act.
+  const candText = `${cand.title} ${cand.version ?? ''} ${cand.artists.join(' ')}`;
   const srcText = `${source.title ?? ''} ${source.artists.join(' ')}`;
-  if (IMPOSTOR.test(candText) && !IMPOSTOR.test(srcText)) score *= 0.5;
+  if (IMPOSTOR.test(candText) && !IMPOSTOR.test(srcText) && (artistScore ?? 0) < 0.9) score *= 0.5;
 
   if (source.album && cand.album) {
     const albumScore = similarity(normalizeTitle(source.album).core, normalizeTitle(cand.album).core);
@@ -146,12 +175,17 @@ export function shouldPreselect(result: Pick<MatchResult, 'status' | 'best'>): b
 export function buildQueries(source: SourceTrack): string[] {
   const title = searchText(source.title ?? '');
   if (!title) return [];
+  const fullTitle = searchText(source.title ?? '', { keepQualifiers: true });
   const artist = source.artists[0] ? searchText(source.artists[0]).replace(/,/g, ' ') : '';
   const firstArtist = source.artists[0] ? splitArtists(source.artists[0])[0] ?? '' : '';
+  const words = title.split(' ');
   const qs = [
+    artist && `${artist} ${fullTitle}`,
     artist && `${artist} ${title}`,
     firstArtist && firstArtist !== artist && `${firstArtist} ${title}`,
     (!artist || source.hints?.weakArtist === '1') && title,
+    // Very long titles (classical movements, post-rock) often return nothing; try the start.
+    words.length > 6 && `${artist} ${words.slice(0, 6).join(' ')}`,
     source.album && !artist && `${title} ${searchText(source.album)}`,
   ];
   return [...new Set(qs.filter((q): q is string => Boolean(q)).map((q) => q.replace(/\s+/g, ' ').trim()))];

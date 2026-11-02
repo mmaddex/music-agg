@@ -25,7 +25,7 @@ export function recordFrom(header: string[], row: string[]): Record<string, stri
   // Null-prototype object so a header like "__proto__" can't do anything surprising.
   const rec: Record<string, string> = Object.create(null);
   header.forEach((h, i) => {
-    if (h) rec[h] = (row[i] ?? '').trim();
+    if (h) rec[h] = (row[i] ?? '').trim().normalize('NFC');
   });
   return rec;
 }

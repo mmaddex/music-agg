@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { Matcher, artistSimilarity, buildQueries, classify, scoreCandidate, shouldPreselect, type CatalogSearch } from '../src/core/matching/matcher.js';
+import { Matcher, artistSimilarity, buildQueries, classify, identifyingNumbers, scoreCandidate, shouldPreselect, type CatalogSearch } from '../src/core/matching/matcher.js';
 import { normalizeTitle } from '../src/core/matching/normalize.js';
 import type { SourceTrack } from '../src/core/model.js';
 import type { TidalTrack } from '../src/core/tidal/client.js';
@@ -149,5 +149,54 @@ describe('preselection', () => {
     const status = classify(s, best);
     expect(status).toBe('review');
     expect(shouldPreselect({ status, best })).toBe(true);
+  });
+});
+
+describe('regressions from a live run against the TIDAL catalog', () => {
+  it('an album named "Karaoke Angel" is not a karaoke cover', () => {
+    const s = src('Almost Free', 'Molly Sarlé', { album: 'Karaoke Angel' });
+    const best = scoreCandidate(s, track('1', 'Almost Free', ['Molly Sarlé'], { album: 'Karaoke Angel' }));
+    expect(classify(s, best)).toBe('matched');
+  });
+
+  it('fully bracketed titles still produce a search', () => {
+    expect(buildQueries(src('[More Rain]', 'M. Ward'))[0]).toBe('M. Ward More Rain');
+    expect(normalizeTitle('[More Rain]').core).toBe('more rain');
+  });
+
+  it('keeps meaningful parentheticals in the first query', () => {
+    const qs = buildQueries(src('Wilco (The Song)', 'Wilco'));
+    expect(qs.slice(0, 2)).toEqual(['Wilco Wilco The Song', 'Wilco Wilco']);
+    expect(buildQueries(src('Day After Day (Remastered 2010)', 'Badfinger'))[0]).toBe('Badfinger Day After Day');
+  });
+
+  it('adds a shortened query for very long titles', () => {
+    const qs = buildQueries(src('The Sixth Extinction Crept Up Slowly, Like The Sunlight Through The Shutters', 'Red Sparowes'));
+    expect(qs).toContain('Red Sparowes The Sixth Extinction Crept Up Slowly,');
+  });
+});
+
+describe('classical works', () => {
+  const work = 'Divertimento in F Major, K. 138, "Salzburg Symphony No. 3"';
+  it('does not match a different movement of the same work', () => {
+    const s = src(`${work}: I. Allegro`, 'Budapest Franz Liszt Chamber Orchestra');
+    const other = scoreCandidate(s, track('1', `${work}: II. Andante`, ['Franz Liszt Chamber Orchestra']));
+    const same = scoreCandidate(s, track('2', `${work}: I. Allegro`, ['Franz Liszt Chamber Orchestra']));
+    expect(classify(s, other)).not.toBe('matched');
+    expect(same.score).toBeGreaterThan(other.score);
+  });
+
+  it('tolerates punctuation differences and extra catalogue numbers on the TIDAL side', () => {
+    const s = src('Gallimathias musicum, K. 32: No. 11. Largo. No. 12. Molto Allegro', 'Budapest Franz Liszt Chamber Orchestra');
+    const c = scoreCandidate(s, track('3', 'Gallimathias musicum, K. 32: No. 11,  Largo.  No. 12, Molto Allegro', ['Budapest Franz Liszt Chamber Orchestra', 'János Rolla']));
+    expect(classify(s, c)).toBe('matched');
+  });
+
+  it('ignores years inside remaster notes and the word "I"', () => {
+    expect(identifyingNumbers('Day After Day (Remastered 2010)'.replace(/\s*\(Remastered 2010\)/, ''))).toEqual(new Set());
+    expect(identifyingNumbers('I Will Follow')).toEqual(new Set());
+    expect(identifyingNumbers('Symphony No. 9: IV. Presto')).toEqual(new Set(['9', 'mvt:iv']));
+    const s = src('Day After Day (Remastered 2010)', 'Badfinger');
+    expect(classify(s, scoreCandidate(s, track('4', 'Day After Day', ['Badfinger'])))).toBe('matched');
   });
 });
