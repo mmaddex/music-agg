@@ -58,8 +58,8 @@ Task settings (`src/workflows/tasks.js`):
 
 | Task | Retries (backoff) | Timeout | Plan |
 | ---- | ----------------- | ------- | ---- |
-| `matchChunk`, `writeCollection` | 6 × from 15 s, ×2 | 30 min | starter |
-| `matchImport`, `loadToTidal` | 2 × from 30 s, ×2 | 12 h | starter |
+| `matchChunk`, `writeCollection` | 6 × from 15 s, ×2 | 30 min | flex |
+| `matchImport`, `loadToTidal` | 2 × from 30 s, ×2 | 12 h | flex |
 
 ## TIDAL API usage
 

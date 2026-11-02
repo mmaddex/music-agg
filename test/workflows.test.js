@@ -221,5 +221,5 @@ test('the Workflow entry point registers all tasks with their retry options', as
   // This is the wire format the SDK sends to Render when registering.
   assert.deepEqual(byName.matchChunk.retry, { max_retries: 6, wait_duration_ms: 15000, factor: 2 });
   assert.equal(byName.matchImport.timeout_seconds, 12 * 3600);
-  assert.equal(byName.writeCollection.plan, 'starter');
+  for (const t of tasks) assert.equal(t.options.plan, 'flex', t.name);
 });
