@@ -1,8 +1,7 @@
 # Render Blueprint: https://render.com/docs/blueprint-spec
 #
-# Creates the web service, its Postgres database, and an env group shared with the
-# Workflow service. Workflow services can't be declared in Blueprints yet, so create
-# that one in the Dashboard (see README → "Deploying to Render").
+# Everything the app needs: the web service, the Workflow service that runs matching and
+# loading, and the Postgres database both of them share.
 databases:
   - name: music-agg-db
     plan: basic-256mb
@@ -11,9 +10,7 @@ databases:
     user: music_agg
 
 envVarGroups:
-  # Link this group to the Workflow service too, so both can decrypt the same stored
-  # TIDAL tokens. (Env groups can't reference databases, so DATABASE_URL is set per
-  # service: below for the web service, by hand for the Workflow service.)
+  # Shared by the web and Workflow services: both must decrypt the same stored TIDAL tokens.
   - name: music-agg-shared
     envVars:
       - key: TOKEN_ENCRYPTION_KEY
@@ -37,17 +34,42 @@ services:
         fromDatabase:
           name: music-agg-db
           property: connectionString
+      # Where the web service starts workflow runs.
+      - key: WORKFLOW_SLUG
+        fromService:
+          type: workflow
+          name: music-agg-workflows
+          property: slug
+      - key: RENDER_API_KEY
+        sync: false # Account settings → API keys; lets the web service start workflow runs
       - key: NODE_ENV
         value: production
       - key: SESSION_SECRET
         generateValue: true
       - key: TIDAL_CLIENT_ID
         sync: false # from developer.tidal.com → your app
-      - key: RENDER_API_KEY
-        sync: false # Account settings → API keys; lets the web service start workflow runs
-      - key: WORKFLOW_SLUG
-        sync: false # slug of the Workflow service, e.g. music-agg-workflows
       # Optional. Defaults to $RENDER_EXTERNAL_URL/auth/callback (set by Render).
       # Set it if you use a custom domain; it must match a redirect URI registered with TIDAL.
       - key: TIDAL_REDIRECT_URI
         sync: false
+
+  # Runs matchImport / matchChunk / loadToTidal / writeCollection (src/workflows/tasks.js).
+  # Workflows need an explicit region; compute plans are set per task in code.
+  - type: workflow
+    name: music-agg-workflows
+    runtime: node
+    region: oregon
+    buildCommand: npm ci --omit=dev
+    startCommand: npm run start:workflows
+    envVars:
+      - fromGroup: music-agg-shared
+      - key: DATABASE_URL
+        fromDatabase:
+          name: music-agg-db
+          property: connectionString
+      - key: TIDAL_CLIENT_ID
+        sync: false # same value as the web service; used to refresh TIDAL tokens
+      # Optional tuning:
+      # - key: TIDAL_MIN_INTERVAL_MS   # spacing between TIDAL calls per run (default 200)
+      # - key: MATCH_CHUNK_SIZE        # tracks per matchChunk run (default 100)
+      # - key: MATCH_PARALLELISM       # matchChunk runs in flight per import (default 2)

@@ -30,6 +30,7 @@ Browser ──► Web service (Express)                     Render Workflow serv
 
 * **Parsing stays in the web service.** It takes under a second, makes no network calls, and
   you see the result right away to pick playlists. Retries would add nothing.
+* **Both services and the database are in the Blueprint** (`render.yaml`).
 * **Task inputs are only ids.** Track data and TIDAL tokens are read from Postgres, never
   passed as run arguments. Run arguments are visible in the Render Dashboard and capped at 4 MB.
 
@@ -120,32 +121,23 @@ npm run inspect-export -- path/to/export.zip    # what an export would import, n
 
 ## Deploying to Render
 
-1. **Blueprint** (`render.yaml`): Dashboard → **New → Blueprint** → this repo. This creates the
-   web service, the `music-agg-db` Postgres database and the `music-agg-shared` env group
-   (a generated `TOKEN_ENCRYPTION_KEY`). The web service gets `DATABASE_URL` from the database
-   directly. Enter `TIDAL_CLIENT_ID` when prompted. You can leave `RENDER_API_KEY` and
-   `WORKFLOW_SLUG` empty for now.
-2. **Workflow service.** Blueprints don't support these yet. Dashboard → **New → Workflow** →
-   same repo and branch, region **Oregon** (same as the database):
-   * Language: Node · Root directory: *(repo root)*
-   * Build command: `npm ci --omit=dev`
-   * Start command: `node src/workflows/main.js`
-   * Environment: link the **`music-agg-shared`** env group (or copy its
-     `TOKEN_ENCRYPTION_KEY`). Add `DATABASE_URL` with the database's **Internal Database URL**
-     (database page → Connect), and `TIDAL_CLIENT_ID`. Optional tuning:
-     `TIDAL_MIN_INTERVAL_MS`, `MATCH_CHUNK_SIZE`, `MATCH_PARALLELISM`.
-   * Deploy. The four tasks register automatically. Note the slug shown on a task's page
-     (`<slug>/matchImport`).
-3. **Connect the web service to it.** Set `WORKFLOW_SLUG` to that slug and `RENDER_API_KEY` to
-   an API key from Account settings → API keys, then redeploy the web service. `/api/me`
-   reports `workflowMode: "render"` once it's wired.
-4. **TIDAL redirect URI:** register `https://<web-service>.onrender.com/auth/callback`. For a
-   custom domain, register that domain's callback and set `TIDAL_REDIRECT_URI`.
+`render.yaml` defines everything: the web service, the **Workflow service**
+(`music-agg-workflows`), the `music-agg-db` Postgres database, and the `music-agg-shared` env
+group. The env group holds a generated `TOKEN_ENCRYPTION_KEY` that both services share.
 
-Both services must use the **same** `TOKEN_ENCRYPTION_KEY`, or tasks can't read the user's
-TIDAL tokens. If the Workflow service can't reach the database over the internal URL, give
-it the database's *external* connection string; TLS is detected automatically, or force it
-with `DATABASE_SSL=true`.
+1. Dashboard → **New → Blueprint** → this repo. When prompted, enter:
+   * `TIDAL_CLIENT_ID` on **both** services (same value)
+   * `RENDER_API_KEY` on the web service (Account settings → API keys), so it can start runs
+   * `TIDAL_REDIRECT_URI` only if you use a custom domain; otherwise leave it blank
+2. The web service gets `DATABASE_URL` and `WORKFLOW_SLUG` automatically (`fromDatabase` /
+   `fromService … property: slug`), and the four tasks register when the Workflow service
+   deploys. `/api/me` reports `workflowMode: "render"` once it's wired.
+3. **TIDAL redirect URI:** register `https://<web-service>.onrender.com/auth/callback` (the exact
+   URL is on the service page). For a custom domain, register that domain's callback and set
+   `TIDAL_REDIRECT_URI` to it.
+
+Both services must use the **same** `TOKEN_ENCRYPTION_KEY` (the shared group handles this), or
+tasks can't read the user's TIDAL tokens.
 
 ## Configuration
 
