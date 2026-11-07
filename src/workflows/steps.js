@@ -366,7 +366,7 @@ export async function writeCollection(deps, importId, collectionId) {
       }
       // Saved in one statement: the album list and the reduced track list replace each other.
       await repo.updateTarget(pool, importId, collectionId, { albums: JSON.stringify(plan.albums), items: JSON.stringify(plan.items) });
-      log.info('load.albums.planned', { albumsChecked: plan.checked, wholeAlbums: plan.albums.length, tracksInAlbums: t.items.length - plan.items.length, looseTracks: plan.items.length, ms: since(planStartedAt) });
+      log.info('load.albums.planned', { albumsChecked: plan.checked, wholeAlbums: plan.albums.length, expandedEditions: plan.albums.filter((a) => a.rule === 'edition').length, tracksInAlbums: t.items.length - plan.items.length, looseTracks: plan.items.length, ms: since(planStartedAt) });
       t = { ...t, albums: plan.albums, items: plan.items };
     }
     let albumsAdded = t.albums_added;

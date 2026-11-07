@@ -402,7 +402,7 @@ function showDone(view) {
           c.albums?.length ? `, ${c.albums.length} full album${c.albums.length === 1 ? '' : 's'} saved` : '',
           c.notImported ? `, ${c.notImported} not imported` : '',
           c.albums?.length
-            ? h('details', {}, h('summary', {}, 'Albums saved whole'), h('ul', {}, ...c.albums.map((a) => h('li', {}, `${a.title}${a.artists?.length ? ` — ${a.artists.join(', ')}` : ''} (${a.trackCount} tracks)`))))
+            ? h('details', {}, h('summary', {}, 'Albums saved whole'), h('ul', {}, ...c.albums.map((a) => h('li', {}, `${a.title}${a.artists?.length ? ` — ${a.artists.join(', ')}` : ''} (${a.trackCount} tracks${a.extras ? `, incl. ${a.extras} extra on this edition` : ''})`))))
             : null,
           c.error ? h('div', { class: 'err' }, c.error) : null,
         ),

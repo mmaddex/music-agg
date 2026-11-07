@@ -76,8 +76,9 @@ export async function albumIdsForTracks(client, trackIds, { countryCode } = {}) 
 const relativeLink = (next) => next.replace(/^https?:\/\/[^/]+/, '').replace(/^\/v2(?=\/)/, '');
 
 /**
- * An album and the ids of every track on it (all volumes, all pages; videos left out).
- * @returns { id, title, albumType, numberOfItems, artists[], trackIds[] }
+ * An album and every track on it (all volumes, all pages; videos left out), in album order.
+ * @returns { id, title, albumType, numberOfItems, artists[], trackIds[],
+ *            tracks: [{ id, title, version, trackNumber, volumeNumber }] }
  */
 export async function getAlbumWithTracks(client, albumId, { countryCode } = {}) {
   const doc = await client.get(`/albums/${encodeURIComponent(albumId)}`, { countryCode, include: 'items,artists' });
@@ -88,16 +89,31 @@ export async function getAlbumWithTracks(client, albumId, { countryCode } = {}) 
   const refs = [...(items.data || [])];
   let next = items.links?.next;
   for (let page = 0; next && page < 50; page += 1) {
-    const more = await client.get(relativeLink(next));
+    const more = await client.get(relativeLink(next), { countryCode, include: 'items' });
+    for (const [k, v] of indexIncluded(more)) included.set(k, v);
     refs.push(...(more.data || []));
     next = more.links?.next;
   }
+  const tracks = refs
+    .filter((r) => r.type === 'tracks')
+    .map((r, i) => {
+      const attrs = included.get(`tracks:${r.id}`)?.attributes || {};
+      return {
+        id: String(r.id),
+        title: attrs.title || null,
+        version: attrs.version || null,
+        trackNumber: r.meta?.trackNumber ?? i + 1,
+        volumeNumber: r.meta?.volumeNumber ?? 1,
+      };
+    })
+    .sort((x, y) => x.volumeNumber - y.volumeNumber || x.trackNumber - y.trackNumber);
   return {
     id: String(data?.id ?? albumId),
     title: a.title || null,
     albumType: a.albumType || null,
     numberOfItems: a.numberOfItems ?? null,
     artists: (data?.relationships?.artists?.data || []).map((ref) => included.get(`${ref.type}:${ref.id}`)?.attributes?.name).filter(Boolean),
-    trackIds: refs.filter((r) => r.type === 'tracks').map((r) => String(r.id)),
+    trackIds: tracks.map((t) => t.id),
+    tracks,
   };
 }

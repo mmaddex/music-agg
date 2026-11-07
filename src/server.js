@@ -75,7 +75,7 @@ async function importView(pool, imp, { withResults = false } = {}) {
         error: t.error,
         url: t.kind === 'favorites' ? 'https://tidal.com/my-collection/tracks' : t.tidal_playlist_id ? `https://tidal.com/playlist/${t.tidal_playlist_id}` : null,
         notImported: t.unimported.length,
-        albums: (t.albums || []).map((a) => ({ id: a.id, title: a.title, artists: a.artists, trackCount: a.trackCount })),
+        albums: (t.albums || []).map((a) => ({ id: a.id, title: a.title, artists: a.artists, trackCount: a.trackCount, rule: a.rule || 'exact', extras: a.extras || 0 })),
         albumsAdded: t.albums_added,
       };
     });

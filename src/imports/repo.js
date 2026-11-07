@@ -229,7 +229,7 @@ export async function prepareLoad(pool, imp, targets, decisions = {}) {
       }
       if (seen.has(id)) continue; // two source tracks that map to one TIDAL track: added once
       seen.add(id);
-      items.push({ id, addedAt: item.addedAt || null, key: item.key, albumId: albumOf(item.key, id) });
+      items.push({ id, addedAt: item.addedAt || null, key: item.key, albumId: albumOf(item.key, id), sourceAlbum: tracks[item.key]?.album || null });
     }
     const name = String(target.name || c.name).trim().slice(0, 250) || c.name;
     rows.push({ c, position, name, items, unimported, skipped: c.items.length - items.length });
