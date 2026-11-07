@@ -17,7 +17,16 @@ const state = {
   pollToken: 0,
 };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const STATUS_LABEL = { parsed: 'Uploaded', matching: 'Matching…', matched: 'Ready to review', loading: 'Importing…', done: 'Done', failed: 'Needs attention' };
+const STATUS_LABEL = { parsed: 'Uploaded', matching: 'Matching…', matched: 'Ready to review', loading: 'Importing…', done: 'Done', failed: 'Failed' };
+const STOPPED_LABEL = { cancelled: 'Cancelled', interrupted: 'Interrupted' };
+
+/** "Interrupted while importing to TIDAL", "Failed during matching", "Done", … */
+function statusText(i) {
+  const reason = i.stopped_reason ?? i.stoppedReason;
+  if (i.status !== 'failed') return STATUS_LABEL[i.status] || i.status;
+  const label = STOPPED_LABEL[reason] || STATUS_LABEL.failed;
+  return `${label} ${i.stage === 'load' ? 'while importing to TIDAL' : 'during matching'} — open to retry`;
+}
 
 function h(tag, attrs = {}, ...children) {
   const el = document.createElement(tag);
@@ -165,7 +174,8 @@ function setProgress(title, phase, done, total) {
 
 function showFailed(view) {
   show('progress');
-  $('#progress-title').textContent = view.stage === 'load' ? 'Import to TIDAL stopped' : 'Matching stopped';
+  const what = view.stage === 'load' ? 'Import to TIDAL' : 'Matching';
+  $('#progress-title').textContent = { cancelled: `${what} was cancelled`, interrupted: `${what} was interrupted` }[view.stoppedReason] || `${what} stopped`;
   $('#progress-failed').hidden = false;
   $('#progress-note').hidden = true;
   $('#progress-error').textContent = view.error || 'Something went wrong.';
@@ -257,7 +267,7 @@ async function loadRecent() {
       h(
         'li',
         {},
-        h('div', {}, h('div', {}, i.filename), h('div', { class: 'meta' }, `${STATUS_LABEL[i.status] || i.status} · ${new Date(i.created_at).toLocaleString()}`)),
+        h('div', {}, h('div', {}, i.filename), h('div', { class: `meta${i.status === 'failed' ? ' err' : ''}` }, `${statusText(i)} · ${new Date(i.created_at).toLocaleString()}`)),
         h('button', { class: 'button', onclick: () => openImport(i.id) }, i.status === 'done' ? 'View' : 'Open'),
       ),
     ),

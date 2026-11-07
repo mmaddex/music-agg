@@ -26,7 +26,7 @@ export async function getImport(db, id, accountId = null) {
 
 export async function listImports(pool, accountId, limit = 10) {
   const { rows } = await pool.query(
-    `SELECT id, filename, format_label, status, stage, error, created_at, updated_at
+    `SELECT id, filename, format_label, status, stage, error, stopped_reason, match_run_id, load_run_id, created_at, updated_at
        FROM imports WHERE account_id = $1 ORDER BY created_at DESC LIMIT $2`,
     [accountId, limit],
   );
@@ -45,6 +45,23 @@ export async function setStatus(db, id, status, { stage, error = null, runField,
     sets.push(`${runField === 'load' ? 'load_run_id' : 'match_run_id'} = $${args.length}`);
   }
   await db.query(`UPDATE imports SET ${sets.join(', ')} WHERE id = $1`, args);
+}
+
+/**
+ * Mark an active import as stopped because its workflow run ended without finishing it.
+ * Only applies if the import is still in that status and still points at that run, so a run
+ * that finished normally, or a newer dispatch, is never overwritten.
+ * @returns true if the import was updated
+ */
+export async function markStopped(db, imp, { reason, error }) {
+  const runCol = imp.status === 'loading' ? 'load_run_id' : 'match_run_id';
+  const runId = imp.status === 'loading' ? imp.load_run_id : imp.match_run_id;
+  const { rowCount } = await db.query(
+    `UPDATE imports SET status = 'failed', stopped_reason = $3, error = $4, updated_at = now()
+      WHERE id = $1 AND status = $2 AND ${runCol} = $5`,
+    [imp.id, imp.status, reason, error, runId],
+  );
+  return rowCount > 0;
 }
 
 export async function bumpDispatchCount(pool, id) {

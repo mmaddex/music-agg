@@ -37,6 +37,40 @@ function csvCell(v) {
   return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 }
 
+const STAGE_WORDS = { matching: 'Matching', loading: 'The import to TIDAL' };
+const RECONCILE_EVERY_MS = 30_000;
+const lastReconciled = new Map(); // import id → ms
+
+/**
+ * An import says it's matching/loading, but is its workflow run still alive? If Render reports
+ * the run cancelled, failed, or finished while the import is still active, mark the import
+ * stopped (cancelled / interrupted) so the user sees it and can press Retry. Checked at most
+ * every 30 s per import; any doubt (no run id yet, API error) leaves the import alone.
+ * @returns the import, updated if it was marked stopped
+ */
+export async function reconcileImport(pool, dispatcher, imp, { force = false } = {}) {
+  if (!repo.ACTIVE_STATUSES.includes(imp.status) || !dispatcher.runState) return imp;
+  const runId = imp.status === 'loading' ? imp.load_run_id : imp.match_run_id;
+  if (!runId) return imp; // being dispatched right now
+  const now = Date.now();
+  if (!force && now - (lastReconciled.get(imp.id) || 0) < RECONCILE_EVERY_MS) return imp;
+  lastReconciled.set(imp.id, now);
+
+  const state = await dispatcher.runState(runId);
+  if (!state || state === 'active') return imp;
+  const what = STAGE_WORDS[imp.status];
+  const stopped =
+    state === 'canceled'
+      ? { reason: 'cancelled', error: `${what} was cancelled before it finished. Press Retry to resume where it stopped.` }
+      : { reason: 'interrupted', error: `${what} stopped unexpectedly before it finished (workflow run ${state}). Press Retry to resume where it stopped.` };
+  if (await repo.markStopped(pool, imp, stopped)) {
+    log.warn('import.stopped', { importId: imp.id, status: imp.status, taskRunId: runId, runState: state, reason: stopped.reason });
+    lastReconciled.delete(imp.id);
+    return { ...imp, status: 'failed', stopped_reason: stopped.reason, error: stopped.error };
+  }
+  return imp;
+}
+
 /** Build the JSON the browser polls for one import. */
 async function importView(pool, imp, { withResults = false } = {}) {
   const view = {
@@ -46,6 +80,7 @@ async function importView(pool, imp, { withResults = false } = {}) {
     formatLabel: imp.format_label,
     status: imp.status,
     stage: imp.stage,
+    stoppedReason: imp.stopped_reason || null,
     error: imp.error,
     warnings: imp.warnings,
     selected: imp.selected,
@@ -140,16 +175,20 @@ export function createApp({ pool, dispatcher, fetchImpl = fetch }) {
     next();
   });
 
-  const loadImport = async (req) => {
+  const loadImport = async (req, { force = false } = {}) => {
     const imp = await repo.getImport(pool, req.params.importId, req.account.id);
     if (!imp) throw new HttpError(404, 'Import not found.');
-    return imp;
+    return reconcileImport(pool, dispatcher, imp, { force });
   };
 
   /** Atomically move an import into an active status so double-clicks can't start two runs. */
   const claim = async (importId, fromStatuses, toStatus, stage) => {
     const { rowCount } = await pool.query(
-      `UPDATE imports SET status = $3, stage = $4, error = NULL, updated_at = now() WHERE id = $1 AND status = ANY($2::text[])`,
+      // The previous run's id is cleared: until the new run's id is saved, nothing judges this
+      // import by the old run's final status.
+      `UPDATE imports SET status = $3, stage = $4, error = NULL, stopped_reason = NULL,
+              ${stage === 'load' ? 'load_run_id' : 'match_run_id'} = NULL, updated_at = now()
+        WHERE id = $1 AND status = ANY($2::text[])`,
       [importId, fromStatuses, toStatus, stage],
     );
     if (!rowCount) throw new HttpError(409, 'This import is busy or not ready for that step.');
@@ -237,7 +276,10 @@ export function createApp({ pool, dispatcher, fetchImpl = fetch }) {
   }));
 
   app.get('/api/imports', requireLogin, wrap(async (req, res) => {
-    res.json({ imports: await repo.listImports(pool, req.account.id) });
+    const imports = await Promise.all((await repo.listImports(pool, req.account.id)).map((i) => reconcileImport(pool, dispatcher, i)));
+    res.json({
+      imports: imports.map(({ match_run_id: _m, load_run_id: _l, ...i }) => i),
+    });
   }));
 
   app.post('/api/uploads', requireLogin, upload.single('file'), wrap(async (req, res) => {
@@ -322,7 +364,7 @@ export function createApp({ pool, dispatcher, fetchImpl = fetch }) {
 
   // Resume a failed import from its checkpoints.
   app.post('/api/imports/:importId/retry', requireLogin, wrap(async (req, res) => {
-    const imp = await loadImport(req);
+    const imp = await loadImport(req, { force: true });
     if (imp.status !== 'failed' || !imp.stage) throw new HttpError(409, 'Only failed imports can be retried.');
     if (imp.stage === 'match') {
       await claim(imp.id, ['failed'], 'matching', 'match');

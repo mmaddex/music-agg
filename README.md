@@ -49,6 +49,11 @@ Browser ──► Web service (Express)                     Render Workflow serv
   problems (429, 5xx, network, timeouts). Permanent problems are recorded instead: one bad
   track, one rejected playlist, or an expired login. A track that keeps failing is given up on
   after 4 tries so it can't block the rest.
+* **Cancelled or interrupted runs:** if an import still says matching/importing but Render
+  reports its workflow run as `canceled`, `failed`, or finished without completing it, the
+  import is marked **Cancelled** or **Interrupted** (checked when the import or the recent-imports
+  list is viewed, at most every 30 s per import). Retry resumes from the checkpoints. A run that
+  is pending, running or paused, or a status the API can't return, leaves the import alone.
 * **Expired login:** the import stops with "log in again, then press Retry". After you log in,
   Retry picks up where it stopped.
 * **Token refresh** happens under a row lock, so parallel task instances never race each
@@ -87,9 +92,16 @@ Matching scores each candidate on title, artist, album, duration and version mar
 ### Whole albums (favourites only)
 
 Before adding your liked songs, the load step groups them by the TIDAL album each one matched
-to. If **every** track TIDAL lists on an album is in your liked songs, the album is saved to
-My Collection › Albums and those tracks are **not** also added one by one. Everything else is
-added as individual favourite tracks.
+to. If you have the whole album, it's saved to My Collection › Albums and those tracks are
+**not** also added one by one. Everything else is added as individual favourite tracks.
+"The whole album" means either:
+
+* **exact:** every track TIDAL lists on the album is in your liked songs, or
+* **expanded edition:** TIDAL only has a Deluxe / Expanded / Anniversary / Remastered … edition
+  with songs your source never had. It's saved when, in album order, every track up to your last
+  one is present or is an obvious extra (Demo, Live, Remix, Bonus …); the rest is treated as the
+  bonus tail (including whole extra discs); you have at least half its tracks and at least 3; and,
+  if your export has album names, yours matches TIDAL's title without the edition suffix.
 
 * Singles are never saved as albums, and an album needs at least 2 tracks.
 * "Every track" is judged by TIDAL track id. If some songs matched a different release of the

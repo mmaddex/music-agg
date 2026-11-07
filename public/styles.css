@@ -107,3 +107,4 @@ details.coll .table-wrap { overflow-x: auto; padding: 0 8px 8px; }
 .recent .meta { font-size: 13px; color: var(--muted); }
 .failed { margin-top: 12px; padding: 12px; border-radius: 8px; border: 1px solid var(--bad); background: color-mix(in srgb, var(--bad) 8%, var(--card)); }
 .failed p { margin: 0; }
+.meta.err { color: var(--bad); }

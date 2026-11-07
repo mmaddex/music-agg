@@ -80,3 +80,9 @@ ALTER TABLE import_targets ADD COLUMN IF NOT EXISTS unimported jsonb NOT NULL DE
 ALTER TABLE import_targets ADD COLUMN IF NOT EXISTS albums jsonb;
 ALTER TABLE import_targets ADD COLUMN IF NOT EXISTS albums_done integer NOT NULL DEFAULT 0;
 ALTER TABLE import_targets ADD COLUMN IF NOT EXISTS albums_added integer NOT NULL DEFAULT 0;
+
+-- Why an import stopped without finishing, when its workflow run ended on its own:
+--   cancelled   | the run was cancelled (e.g. from the Render dashboard)
+--   interrupted | the run ended (crashed, failed or returned) while the import was still active
+-- NULL for imports that finished, are running, or failed with an error the app recorded itself.
+ALTER TABLE imports ADD COLUMN IF NOT EXISTS stopped_reason text;
