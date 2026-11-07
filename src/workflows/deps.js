@@ -11,7 +11,8 @@ export function workflowSettings(env = process.env) {
   return {
     chunkSize: Number(env.MATCH_CHUNK_SIZE) || 100,
     parallelism: Number(env.MATCH_PARALLELISM) || 2,
-    minIntervalMs: Number(env.TIDAL_MIN_INTERVAL_MS ?? 200),
+    minIntervalMs: Number(env.TIDAL_MIN_INTERVAL_MS ?? 200), // floor for the shared pace
+    startIntervalMs: Number(env.TIDAL_START_INTERVAL_MS ?? 750), // pace a fresh account starts at
   };
 }
 
@@ -20,7 +21,8 @@ export function buildDeps({ pool, fetchImpl = fetch, settings = workflowSettings
     pool,
     fetchImpl,
     ...settings,
-    clientFor: (accountId, { log } = {}) => clientForAccount(pool, accountId, { clientId, fetchImpl, minIntervalMs: settings.minIntervalMs, clientOptions, log }),
+    clientFor: (accountId, { log } = {}) =>
+      clientForAccount(pool, accountId, { clientId, fetchImpl, minIntervalMs: settings.minIntervalMs, startIntervalMs: settings.startIntervalMs ?? settings.minIntervalMs, clientOptions, log }),
   };
 }
 

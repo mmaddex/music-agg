@@ -86,3 +86,13 @@ ALTER TABLE import_targets ADD COLUMN IF NOT EXISTS albums_added integer NOT NUL
 --   interrupted | the run ended (crashed, failed or returned) while the import was still active
 -- NULL for imports that finished, are running, or failed with an error the app recorded itself.
 ALTER TABLE imports ADD COLUMN IF NOT EXISTS stopped_reason text;
+
+-- Shared request pace per TIDAL account (src/tidal/pacer.js): every task run reserves its next
+-- request slot here, so parallel runs share TIDAL's per-account rate limit instead of colliding.
+CREATE TABLE IF NOT EXISTS tidal_pace (
+  account_id    uuid PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+  interval_ms   integer NOT NULL,             -- current gap between requests (learned)
+  next_at       timestamptz NOT NULL,         -- earliest time the next slot can start
+  paused_until  timestamptz,                  -- set from Retry-After on a 429
+  updated_at    timestamptz NOT NULL DEFAULT now()
+);

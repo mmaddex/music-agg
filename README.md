@@ -56,6 +56,11 @@ Browser ──► Web service (Express)                     Render Workflow serv
   is pending, running or paused, or a status the API can't return, leaves the import alone.
 * **Expired login:** the import stops with "log in again, then press Retry". After you log in,
   Retry picks up where it stopped.
+* **Rate limits:** TIDAL limits requests per account, so all task runs for one account share
+  one pace (`tidal_pace` table, `src/tidal/pacer.js`). Each request reserves the next slot; a 429
+  pauses every run until `Retry-After` and widens the gap ×1.5; every 20 successes narrow it 5%.
+  The pace settles just under TIDAL's limit instead of hitting it, and is remembered between
+  imports (reset after an hour idle).
 * **Token refresh** happens under a row lock, so parallel task instances never race each
   other and invalidate the refresh token.
 
@@ -202,7 +207,8 @@ tasks can't read the user's TIDAL tokens.
 | `WORKFLOW_MODE` | web | no | Force `render` or `inline` |
 | `TIDAL_REDIRECT_URI` | web | no | Default `$PUBLIC_BASE_URL/auth/callback` |
 | `PUBLIC_BASE_URL` | web | no | Default `$RENDER_EXTERNAL_URL` or `http://localhost:$PORT` |
-| `TIDAL_MIN_INTERVAL_MS` | workflow | no | Spacing between TIDAL calls per run (default 200) |
+| `TIDAL_MIN_INTERVAL_MS` | workflow | no | Fastest the shared TIDAL pace may go: minimum gap between requests per account (default 200) |
+| `TIDAL_START_INTERVAL_MS` | workflow | no | Gap a fresh (or 1 h idle) account starts at before the pace adapts (default 750) |
 | `MATCH_CHUNK_SIZE` / `MATCH_PARALLELISM` | workflow | no | Default 100 / 2 |
 | `LOG_LEVEL` | both | no | `debug`, `info` (default), `warn`, `error`, `silent`. See [Logs](#logs) |
 | `DATABASE_SSL` | both | no | Override TLS auto-detection |
@@ -229,6 +235,8 @@ every task run; `taskRunId=<trn-…>` matches a run in the Workflow dashboard.
 | `auth.login*`, `tidal.token.*` | web, workflow | logins, token refreshes, refused refreshes (user must log in again) |
 | `task.started` / `task.finished` / `task.threw` | workflow | every task run with duration and Render run ids; `task.threw` is retried by Render |
 | `match.plan`, `match.chunk.started/finished/failed`, `match.finished/failed` | `matchImport` | chunk count and settings, each chunk's duration, final counts |
+| `match.chunk.progress` | `matchChunk` | every 25 tracks / 30 s: tracks done, outcomes so far, tracks per minute, TIDAL requests / 429s, current pace |
+| `tidal.pace.slower` / `faster` (debug) / `db_failed` | workflow | the shared pace reacting to a 429 (new gap, pause) or speeding up; `db_failed` = fell back to local spacing |
 | `match.chunk.begin/done/will_retry` | `matchChunk` | per-chunk time split (YouTube lookup / TIDAL / database), outcomes, TIDAL request, retry and 429 counts, time waiting on the throttle |
 | `match.track.transient_error` / `gave_up` / `error` | `matchChunk` | one line per failing track, with the phase it failed in |
 | `tidal.request.retry` / `gave_up` | workflow | every TIDAL retry: status, attempt, wait, `Retry-After` |

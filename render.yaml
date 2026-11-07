@@ -71,7 +71,8 @@ services:
           name: music-agg-db
           property: connectionString
       # Optional tuning:
-      # - key: TIDAL_MIN_INTERVAL_MS   # spacing between TIDAL calls per run (default 200)
+      # - key: TIDAL_MIN_INTERVAL_MS   # floor for the shared, adaptive TIDAL pace (default 200 ms)
       # - key: MATCH_CHUNK_SIZE        # tracks per matchChunk run (default 100)
       # - key: MATCH_PARALLELISM       # matchChunk runs in flight per import (default 2)
+      # - key: TIDAL_START_INTERVAL_MS # pace a fresh account starts at (default 750 ms; adapts)
       # - key: LOG_LEVEL               # debug | info (default) | warn | error

@@ -7,6 +7,7 @@ import { tx } from './db/pool.js';
 import { refreshTokens, TidalAuthError } from './auth/tidalAuth.js';
 import { TidalClient } from './tidal/client.js';
 import { log as rootLog, since } from './util/log.js';
+import { dbPacer } from './tidal/pacer.js';
 
 /** The user must log in again (refresh token revoked/expired). Not worth retrying. */
 export class AuthExpiredError extends Error {
@@ -78,13 +79,15 @@ async function refreshUnderLock(pool, accountId, { clientId, fetchImpl, stale = 
 }
 
 /** A TidalClient acting as this account. Works in any process that can reach the database. */
-export function clientForAccount(pool, accountId, { clientId = process.env.TIDAL_CLIENT_ID, fetchImpl = fetch, minIntervalMs, clientOptions = {}, log = rootLog } = {}) {
+export function clientForAccount(pool, accountId, { clientId = process.env.TIDAL_CLIENT_ID, fetchImpl = fetch, minIntervalMs, startIntervalMs, clientOptions = {}, log = rootLog } = {}) {
   let current = null;
   return new TidalClient({
     ...clientOptions,
     fetchImpl,
     minIntervalMs,
     log,
+    // Shared with every other run acting for this account.
+    pacer: dbPacer(pool, accountId, { minIntervalMs: minIntervalMs ?? 200, startIntervalMs: startIntervalMs ?? minIntervalMs ?? 750, log: log.child({ component: 'tidal' }) }),
     getAccessToken: async () => {
       const tokens = current || (await readTokens(pool, accountId));
       if (Date.now() < tokens.expiresAt) {

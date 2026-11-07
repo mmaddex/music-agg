@@ -27,6 +27,8 @@ import * as repo from '../imports/repo.js';
 import { log as rootLog, since } from '../util/log.js';
 
 export const MAX_TRACK_ATTEMPTS = 4;
+const PROGRESS_EVERY = 25; // tracks
+const PROGRESS_MS = 30_000;
 
 export class TransientError extends Error {}
 
@@ -170,7 +172,23 @@ export async function matchChunk(deps, importId, keys) {
 
   log.info('match.chunk.begin', { keys: keys.length, tracks: rows.length, firstKey: keys[0], lastKey: keys[keys.length - 1] });
 
-  for (const row of rows) {
+  // A progress line every PROGRESS_EVERY tracks or PROGRESS_MS, so successes show up between
+  // the start and end of a chunk, not only warnings.
+  let lastProgressAt = performance.now();
+  const progress = (done) => {
+    const elapsed = since(startedAt);
+    log.info('match.chunk.progress', {
+      done: `${done}/${rows.length}`,
+      ms: elapsed,
+      tracksPerMin: elapsed ? Math.round((done / elapsed) * 60_000) : 0,
+      ...outcomes,
+      tidal: { requests: client.stats.requests, rateLimited: client.stats.rateLimited, retries: client.stats.retries, paceIntervalMs: client.stats.paceIntervalMs },
+    });
+    lastProgressAt = performance.now();
+  };
+
+  for (const [index, row] of rows.entries()) {
+    if (index > 0 && (index % PROGRESS_EVERY === 0 || performance.now() - lastProgressAt >= PROGRESS_MS)) progress(index);
     const track = row.track;
     const t = { youtube: 0, tidal: 0, db: 0 };
     const requestsBefore = client.stats.requests;

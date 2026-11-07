@@ -5,7 +5,8 @@
 // - 401 → refresh the token once and retry.
 // - 429 / 5xx → back off (honouring Retry-After) and retry. Mutations send an
 //   Idempotency-Key so a retried write is replayed rather than applied twice.
-// - Requests are spaced by `minIntervalMs` to stay well under rate limits.
+// - Requests are spaced: by a shared `pacer` when given (src/tidal/pacer.js: one pace per TIDAL
+//   account across all task runs, adapting to 429s), otherwise locally by `minIntervalMs`.
 
 import crypto from 'node:crypto';
 import { log as rootLog } from '../util/log.js';
@@ -24,7 +25,7 @@ export class TidalApiError extends Error {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-const newStats = () => ({ requests: 0, retries: 0, rateLimited: 0, serverErrors: 0, networkErrors: 0, requestMs: 0, throttleWaitMs: 0, retryWaitMs: 0 });
+const newStats = () => ({ requests: 0, retries: 0, rateLimited: 0, serverErrors: 0, networkErrors: 0, requestMs: 0, throttleWaitMs: 0, retryWaitMs: 0, paceIntervalMs: null });
 
 export class TidalClient {
   /**
@@ -32,7 +33,7 @@ export class TidalClient {
    * @param {() => Promise<string>} opts.getAccessToken  returns a valid access token
    * @param {() => Promise<string>} [opts.forceRefresh]  refreshes and returns a new token
    */
-  constructor({ getAccessToken, forceRefresh, fetchImpl = fetch, baseUrl = API_BASE, minIntervalMs = 200, maxRetries = 5, sleepImpl = sleep, log = rootLog }) {
+  constructor({ getAccessToken, forceRefresh, fetchImpl = fetch, baseUrl = API_BASE, minIntervalMs = 200, maxRetries = 5, sleepImpl = sleep, log = rootLog, pacer = null }) {
     this.getAccessToken = getAccessToken;
     this.forceRefresh = forceRefresh;
     this.fetch = fetchImpl;
@@ -40,6 +41,7 @@ export class TidalClient {
     this.minIntervalMs = minIntervalMs;
     this.maxRetries = maxRetries;
     this.sleep = sleepImpl;
+    this.pacer = pacer;
     this.queue = Promise.resolve();
     this.lastRequestAt = 0;
     this.log = log.child({ component: 'tidal' });
@@ -53,9 +55,17 @@ export class TidalClient {
     return prev;
   }
 
-  /** Serialise request starts so we never exceed one request per minIntervalMs. */
+  /** Wait for this request's slot: the shared pacer's, or local spacing by minIntervalMs. */
   async throttle() {
     const queuedAt = performance.now();
+    const slot = this.pacer ? await this.pacer.reserve() : null;
+    if (slot) {
+      this.stats.paceIntervalMs = slot.intervalMs;
+      if (slot.waitMs > 0) await this.sleep(slot.waitMs);
+      this.lastRequestAt = Date.now();
+      this.stats.throttleWaitMs += Math.round(performance.now() - queuedAt);
+      return;
+    }
     const turn = this.queue.then(async () => {
       const wait = this.lastRequestAt + this.minIntervalMs - Date.now();
       if (wait > 0) await this.sleep(wait);
@@ -137,7 +147,9 @@ export class TidalClient {
         this.stats.retries += 1;
         this.stats.retryWaitMs += waitMs;
         this.log.warn('tidal.request.retry', { method, path, status: res.status, attempt, waitMs, retryAfterMs: retryAfter });
-        await this.sleep(waitMs);
+        // On a 429 the shared pacer holds every run back until Retry-After; the next slot waits.
+        const paced = res.status === 429 && this.pacer ? await this.pacer.rateLimited(waitMs) : false;
+        if (!paced) await this.sleep(waitMs);
         continue;
       }
       if (retryable) this.log.warn('tidal.request.gave_up', { method, path, status: res.status, attempt });
@@ -153,6 +165,7 @@ export class TidalClient {
           path,
         });
       }
+      if (this.pacer) await this.pacer.succeeded();
       return doc;
     }
   }
