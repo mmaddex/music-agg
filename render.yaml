@@ -74,3 +74,4 @@ services:
       # - key: TIDAL_MIN_INTERVAL_MS   # spacing between TIDAL calls per run (default 200)
       # - key: MATCH_CHUNK_SIZE        # tracks per matchChunk run (default 100)
       # - key: MATCH_PARALLELISM       # matchChunk runs in flight per import (default 2)
+      # - key: LOG_LEVEL               # debug | info (default) | warn | error

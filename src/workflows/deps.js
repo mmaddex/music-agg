@@ -3,6 +3,7 @@
 
 import { createPool, migrate } from '../db/pool.js';
 import { clientForAccount } from '../accounts.js';
+import { log } from '../util/log.js';
 
 let depsPromise = null;
 
@@ -19,7 +20,7 @@ export function buildDeps({ pool, fetchImpl = fetch, settings = workflowSettings
     pool,
     fetchImpl,
     ...settings,
-    clientFor: (accountId) => clientForAccount(pool, accountId, { clientId, fetchImpl, minIntervalMs: settings.minIntervalMs, clientOptions }),
+    clientFor: (accountId, { log } = {}) => clientForAccount(pool, accountId, { clientId, fetchImpl, minIntervalMs: settings.minIntervalMs, clientOptions, log }),
   };
 }
 
@@ -30,11 +31,15 @@ export function setDeps(deps) {
 
 export function getDeps() {
   depsPromise ??= (async () => {
+    const startedAt = performance.now();
     const pool = createPool(process.env.DATABASE_URL, { max: 3 });
     await migrate(pool);
-    return buildDeps({ pool });
+    const settings = workflowSettings();
+    log.info('workflow.deps.ready', { ms: Math.round(performance.now() - startedAt), ...settings });
+    return buildDeps({ pool, settings });
   })().catch((err) => {
     depsPromise = null; // let the next attempt (a Render retry) try again
+    log.error('workflow.deps.failed', { err });
     throw err;
   });
   return depsPromise;

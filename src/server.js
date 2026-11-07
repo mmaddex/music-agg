@@ -18,8 +18,10 @@ import * as repo from './imports/repo.js';
 import { createPool, migrate } from './db/pool.js';
 import { buildDeps, setDeps, workflowSettings } from './workflows/deps.js';
 import { createInlineDispatcher, createRenderDispatcher } from './workflows/dispatch.js';
+import { log } from './util/log.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
+const IMPORT_PATH = /^\/api\/imports\/([^/]+)/;
 
 class HttpError extends Error {
   constructor(status, message) {
@@ -89,8 +91,29 @@ export function createApp({ pool, dispatcher, fetchImpl = fetch }) {
       cookie: { httpOnly: true, sameSite: 'lax', secure: config.isProduction ? true : 'auto', maxAge: 30 * 24 * 3600 * 1000 },
     }),
   );
-  app.use(express.json({ limit: '5mb' }));
   app.use(express.static(path.join(here, '..', 'public')));
+
+  // One line per API/auth request. Static files and health checks are skipped as noise.
+  app.use((req, res, next) => {
+    if (req.path === '/healthz' || !(req.path.startsWith('/api/') || req.path.startsWith('/auth/'))) return next();
+    const startedAt = performance.now();
+    res.on('finish', () => {
+      const fields = {
+        method: req.method,
+        path: req.path.replace(IMPORT_PATH, '/api/imports/:importId'),
+        importId: IMPORT_PATH.exec(req.path)?.[1],
+        status: res.statusCode,
+        ms: Math.round(performance.now() - startedAt),
+        accountId: req.session?.accountId,
+        error: res.locals.errorMessage,
+      };
+      if (res.statusCode >= 500) log.error('http.request', fields);
+      else if (res.statusCode >= 400) log.warn('http.request', fields);
+      else log.info('http.request', fields);
+    });
+    next();
+  });
+  app.use(express.json({ limit: '5mb' }));
 
   const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: config.maxUploadBytes, files: 1 } });
 
@@ -126,8 +149,9 @@ export function createApp({ pool, dispatcher, fetchImpl = fetch }) {
     try {
       const runId = await dispatcher.start(taskName, [imp.id], { idempotencyKey: `${imp.id}:${stage}:${n}` });
       await pool.query(`UPDATE imports SET ${stage === 'load' ? 'load_run_id' : 'match_run_id'} = $2 WHERE id = $1`, [imp.id, runId]);
+      log.info('import.dispatched', { importId: imp.id, task: taskName, stage, dispatch: n, taskRunId: runId, mode: dispatcher.mode });
     } catch (err) {
-      console.error(`Failed to start ${taskName}`, err);
+      log.error('import.dispatch_failed', { importId: imp.id, task: taskName, stage, dispatch: n, err });
       await repo.setStatus(pool, imp.id, 'failed', { error: `Could not start the ${stage} workflow (${err.message}). Press Retry.` });
       throw new HttpError(502, 'Could not start the workflow. Please press Retry.');
     }
@@ -154,8 +178,12 @@ export function createApp({ pool, dispatcher, fetchImpl = fetch }) {
     const { code, state, error, error_description: description } = req.query;
     const pending = req.session.oauth;
     delete req.session.oauth;
-    if (error) return res.redirect(`/?authError=${encodeURIComponent(description || error)}`);
+    if (error) {
+      log.warn('auth.login_denied', { error, description });
+      return res.redirect(`/?authError=${encodeURIComponent(description || error)}`);
+    }
     if (!pending || !code || state !== pending.state) {
+      log.warn('auth.login_state_mismatch', { hasPending: Boolean(pending), hasCode: Boolean(code) });
       return res.redirect(`/?authError=${encodeURIComponent('Login expired or was tampered with. Please try again.')}`);
     }
     try {
@@ -166,9 +194,10 @@ export function createApp({ pool, dispatcher, fetchImpl = fetch }) {
       await new Promise((resolve, reject) => req.session.regenerate((e) => (e ? reject(e) : resolve())));
       req.session.accountId = account.id;
       await saveSession(req);
+      log.info('auth.login', { accountId: account.id, country: me.country });
       res.redirect('/');
     } catch (err) {
-      console.error('TIDAL login failed', err);
+      log.error('auth.login_failed', { err });
       res.redirect(`/?authError=${encodeURIComponent(err.message)}`);
     }
   }));
@@ -203,13 +232,28 @@ export function createApp({ pool, dispatcher, fetchImpl = fetch }) {
   app.post('/api/uploads', requireLogin, upload.single('file'), wrap(async (req, res) => {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded.' });
     let library;
+    const startedAt = performance.now();
+    const fileFields = { accountId: req.account.id, filename: req.file.originalname, bytes: req.file.size, requestedFormat: req.body?.format || undefined };
     try {
       library = await parseExport({ filename: req.file.originalname, buffer: req.file.buffer, formatId: req.body?.format || undefined });
     } catch (err) {
-      if (err instanceof BundleError || err instanceof UnknownFormatError) return res.status(422).json({ error: err.message });
+      if (err instanceof BundleError || err instanceof UnknownFormatError) {
+        log.warn('import.parse_rejected', { ...fileFields, ms: Math.round(performance.now() - startedAt), err });
+        return res.status(422).json({ error: err.message });
+      }
       throw err;
     }
     const id = await repo.createImport(pool, { accountId: req.account.id, filename: req.file.originalname, library });
+    log.info('import.created', {
+      ...fileFields,
+      importId: id,
+      format: library.format,
+      collections: library.collections.length,
+      tracks: library.collections.reduce((n, c) => n + c.tracks.length, 0),
+      needsLookup: library.collections.reduce((n, c) => n + c.tracks.filter((t) => t.needsLookup).length, 0),
+      warnings: library.warnings?.length || 0,
+      ms: Math.round(performance.now() - startedAt),
+    });
     res.json(await importView(pool, await repo.getImport(pool, id)));
   }));
 
@@ -272,8 +316,11 @@ export function createApp({ pool, dispatcher, fetchImpl = fetch }) {
       const msg = err.code === 'LIMIT_FILE_SIZE' ? `File is larger than ${config.maxUploadBytes / 1024 / 1024} MB.` : err.message;
       return res.status(413).json({ error: msg });
     }
-    if (err instanceof HttpError) return res.status(err.status).json({ error: err.message });
-    console.error(err);
+    if (err instanceof HttpError) {
+      res.locals.errorMessage = err.message;
+      return res.status(err.status).json({ error: err.message });
+    }
+    log.error('http.unhandled_error', { method: req.method, path: req.path, err });
     res.status(500).json({ error: 'Unexpected server error.' });
   });
 
@@ -297,12 +344,17 @@ export async function createRuntime({ fetchImpl = fetch } = {}) {
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const problems = configProblems();
-  if (problems.length) console.warn(`Configuration warning: ${problems.join(' ')}`);
+  if (problems.length) log.warn('config.problems', { problems: problems.join(' ') });
+  process.on('unhandledRejection', (err) => log.error('server.unhandled_rejection', { err }));
   const { pool, dispatcher } = await createRuntime();
-  const cleanup = () => repo.deleteOldImports(pool, config.retentionDays).catch((e) => console.error('cleanup failed', e));
+  const cleanup = () =>
+    repo
+      .deleteOldImports(pool, config.retentionDays)
+      .then((deleted) => log.info('imports.cleanup', { retentionDays: config.retentionDays, deleted }))
+      .catch((err) => log.error('imports.cleanup_failed', { err }));
   cleanup();
   setInterval(cleanup, 24 * 3600 * 1000).unref();
   createApp({ pool, dispatcher }).listen(config.port, () => {
-    console.log(`music-agg listening on :${config.port} (workflows: ${dispatcher.mode}, redirect URI ${config.tidal.redirectUri})`);
+    log.info('server.listening', { port: config.port, workflowMode: dispatcher.mode, redirectUri: config.tidal.redirectUri, node: process.version });
   });
 }

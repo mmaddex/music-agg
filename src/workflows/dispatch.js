@@ -7,18 +7,25 @@
 import crypto from 'node:crypto';
 import { Render } from '@renderinc/sdk';
 import { TASKS, TASK_OPTIONS } from './tasks.js';
+import { log as rootLog } from '../util/log.js';
+
+const inlineLog = {
+  warn: (msg) => rootLog.warn('workflow.inline.retry', { detail: msg }),
+  error: (msg, err) => rootLog.error('workflow.inline.failed', { detail: msg, err }),
+};
 
 export function createRenderDispatcher({ workflowSlug, token = process.env.RENDER_API_KEY, render = new Render({ token }) }) {
   return {
     mode: 'render',
     async start(taskName, args, { idempotencyKey } = {}) {
       const run = await render.workflows.startTask(`${workflowSlug}/${taskName}`, args, { idempotencyKey });
+      rootLog.info('workflow.run.started', { task: taskName, taskRunId: run.taskRunId, idempotencyKey, mode: 'render' });
       return run.taskRunId;
     },
   };
 }
 
-export function createInlineDispatcher({ waitScale = 1, log = console } = {}) {
+export function createInlineDispatcher({ waitScale = 1, log = inlineLog } = {}) {
   const running = new Set();
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms * waitScale));
 

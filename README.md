@@ -154,10 +154,42 @@ tasks can't read the user's TIDAL tokens.
 | `PUBLIC_BASE_URL` | web | no | Default `$RENDER_EXTERNAL_URL` or `http://localhost:$PORT` |
 | `TIDAL_MIN_INTERVAL_MS` | workflow | no | Spacing between TIDAL calls per run (default 200) |
 | `MATCH_CHUNK_SIZE` / `MATCH_PARALLELISM` | workflow | no | Default 100 / 2 |
+| `LOG_LEVEL` | both | no | `debug`, `info` (default), `warn`, `error`, `silent`. See [Logs](#logs) |
 | `DATABASE_SSL` | both | no | Override TLS auto-detection |
 | `MAX_UPLOAD_MB` / `IMPORT_RETENTION_DAYS` | web | no | Default 100 / 30 |
 
 `TIDAL_CLIENT_SECRET` is **not** used: TIDAL's user-login (PKCE) flow needs only the client id.
+
+## Logs
+
+Both services write one line per event as `key=value` pairs, e.g.
+
+```
+level=info event=match.chunk.done task=matchChunk taskRunId=trn-… importId=… tracks=100 ms=143210 msPerTrack=1432 youtubeMs=… tidalMs=… dbMs=… matched=91 review=6 not_found=3 tidal.requests=212 tidal.rateLimited=0 tidal.throttleWaitMs=…
+```
+
+Search Render's log viewer by text: `importId=<id>` follows one import through the web service and
+every task run; `taskRunId=<trn-…>` matches a run in the Workflow dashboard.
+
+| Event | Where | Tells you |
+| ----- | ----- | --------- |
+| `http.request` | web | method, route, status, duration, account, error message for 4xx |
+| `import.created` / `import.parse_rejected` | web | file, detected format, collection/track counts |
+| `import.dispatched` / `import.dispatch_failed` | web | which workflow run was started for an import |
+| `auth.login*`, `tidal.token.*` | web, workflow | logins, token refreshes, refused refreshes (user must log in again) |
+| `task.started` / `task.finished` / `task.threw` | workflow | every task run with duration and Render run ids; `task.threw` is retried by Render |
+| `match.plan`, `match.chunk.started/finished/failed`, `match.finished/failed` | `matchImport` | chunk count and settings, each chunk's duration, final counts |
+| `match.chunk.begin/done/will_retry` | `matchChunk` | per-chunk time split (YouTube lookup / TIDAL / database), outcomes, TIDAL request, retry and 429 counts, time waiting on the throttle |
+| `match.track.transient_error` / `gave_up` / `error` | `matchChunk` | one line per failing track, with the phase it failed in |
+| `tidal.request.retry` / `gave_up` | workflow | every TIDAL retry: status, attempt, wait, `Retry-After` |
+| `youtube.lookup.failed` | workflow | video id, status, whether it will be retried |
+| `load.plan`, `load.collection.*`, `load.write.*`, `load.playlist.created` | load tasks | per collection: playlist id, batches written, added/skipped, failures |
+
+`LOG_LEVEL=debug` adds one line per TIDAL request (`tidal.request`), per matched track
+(`match.track`, with its timings and request count), per YouTube lookup and per 50-track
+batch. It's verbose: turn it on to investigate, then back off.
+
+Tokens, OAuth codes, cookies and Authorization headers are never logged.
 
 ## Adding an export format
 

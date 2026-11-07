@@ -8,6 +8,7 @@
 // - Requests are spaced by `minIntervalMs` to stay well under rate limits.
 
 import crypto from 'node:crypto';
+import { log as rootLog } from '../util/log.js';
 
 export const API_BASE = 'https://openapi.tidal.com/v2';
 const JSONAPI = 'application/vnd.api+json';
@@ -23,13 +24,15 @@ export class TidalApiError extends Error {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+const newStats = () => ({ requests: 0, retries: 0, rateLimited: 0, serverErrors: 0, networkErrors: 0, requestMs: 0, throttleWaitMs: 0, retryWaitMs: 0 });
+
 export class TidalClient {
   /**
    * @param {object} opts
    * @param {() => Promise<string>} opts.getAccessToken  returns a valid access token
    * @param {() => Promise<string>} [opts.forceRefresh]  refreshes and returns a new token
    */
-  constructor({ getAccessToken, forceRefresh, fetchImpl = fetch, baseUrl = API_BASE, minIntervalMs = 200, maxRetries = 5, sleepImpl = sleep }) {
+  constructor({ getAccessToken, forceRefresh, fetchImpl = fetch, baseUrl = API_BASE, minIntervalMs = 200, maxRetries = 5, sleepImpl = sleep, log = rootLog }) {
     this.getAccessToken = getAccessToken;
     this.forceRefresh = forceRefresh;
     this.fetch = fetchImpl;
@@ -39,17 +42,28 @@ export class TidalClient {
     this.sleep = sleepImpl;
     this.queue = Promise.resolve();
     this.lastRequestAt = 0;
+    this.log = log.child({ component: 'tidal' });
+    this.stats = newStats();
+  }
+
+  /** Counters since the last reset; callers diff or reset them to report per track / chunk. */
+  resetStats() {
+    const prev = this.stats;
+    this.stats = newStats();
+    return prev;
   }
 
   /** Serialise request starts so we never exceed one request per minIntervalMs. */
   async throttle() {
+    const queuedAt = performance.now();
     const turn = this.queue.then(async () => {
       const wait = this.lastRequestAt + this.minIntervalMs - Date.now();
       if (wait > 0) await this.sleep(wait);
       this.lastRequestAt = Date.now();
     });
     this.queue = turn.catch(() => {});
-    return turn;
+    await turn;
+    this.stats.throttleWaitMs += Math.round(performance.now() - queuedAt);
   }
 
   url(path, query) {
@@ -78,16 +92,30 @@ export class TidalClient {
       if (idempotencyKey) headers['idempotency-key'] = idempotencyKey;
 
       let res;
+      const startedAt = performance.now();
+      this.stats.requests += 1;
       try {
         res = await this.fetch(this.url(path, query), { method, headers, body: body ? JSON.stringify(body) : undefined });
       } catch (err) {
-        if (attempt >= this.maxRetries) throw new TidalApiError(`Network error calling TIDAL: ${err.message}`, { path });
-        await this.sleep(backoff(attempt));
+        this.stats.requestMs += Math.round(performance.now() - startedAt);
+        this.stats.networkErrors += 1;
+        if (attempt >= this.maxRetries) {
+          this.log.warn('tidal.request.gave_up', { method, path, attempt, reason: 'network', err });
+          throw new TidalApiError(`Network error calling TIDAL: ${err.message}`, { path });
+        }
+        const waitMs = backoff(attempt);
+        this.stats.retries += 1;
+        this.log.warn('tidal.request.retry', { method, path, attempt, reason: 'network', waitMs, err });
+        await this.sleep(waitMs);
         continue;
       }
+      const ms = Math.round(performance.now() - startedAt);
+      this.stats.requestMs += ms;
+      this.log.debug('tidal.request', { method, path, status: res.status, ms, attempt });
 
       if (res.status === 401 && !refreshed && this.forceRefresh) {
         refreshed = true;
+        this.log.info('tidal.request.unauthorized', { method, path, action: 'refresh_token' });
         await this.forceRefresh();
         attempt -= 1; // a token refresh doesn't count as a retry
         continue;
@@ -98,10 +126,18 @@ export class TidalClient {
       // own earlier attempt, or (with a caller-supplied key) a previous workflow attempt.
       const inFlight = isWrite && res.status === 409 && (attempt > 0 || Boolean(key));
       const retryable = res.status === 429 || res.status >= 500 || inFlight;
+      if (res.status === 429) this.stats.rateLimited += 1;
+      else if (res.status >= 500) this.stats.serverErrors += 1;
       if (retryable && attempt < this.maxRetries) {
-        await this.sleep(retryAfterMs(res) ?? backoff(attempt));
+        const retryAfter = retryAfterMs(res);
+        const waitMs = retryAfter ?? backoff(attempt);
+        this.stats.retries += 1;
+        this.stats.retryWaitMs += waitMs;
+        this.log.warn('tidal.request.retry', { method, path, status: res.status, attempt, waitMs, retryAfterMs: retryAfter });
+        await this.sleep(waitMs);
         continue;
       }
+      if (retryable) this.log.warn('tidal.request.gave_up', { method, path, status: res.status, attempt });
 
       const text = await res.text();
       const doc = text ? safeJson(text) : null;

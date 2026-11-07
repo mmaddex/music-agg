@@ -23,6 +23,7 @@ import { enrichYouTubeTracks } from '../enrich/youtube.js';
 import { matchTrack } from '../tidal/matcher.js';
 import { addFavoritesBatch, addPlaylistBatch, chunk, createPlaylist } from '../tidal/writer.js';
 import * as repo from '../imports/repo.js';
+import { log as rootLog, since } from '../util/log.js';
 
 export const MAX_TRACK_ATTEMPTS = 4;
 
@@ -71,16 +72,42 @@ const authMessage = (err) => (err instanceof AuthExpiredError ? err.message : ne
  */
 export async function matchImport(deps, importId, { runChunk }) {
   const { pool, chunkSize = 100, parallelism = 2 } = deps;
+  const log = (deps.log || rootLog).child({ importId });
+  const startedAt = performance.now();
   const imp = await repo.getImport(pool, importId);
-  if (!imp) return { skipped: 'import not found' };
-  if (imp.status !== 'matching') return { skipped: `import is ${imp.status}` };
+  if (!imp) {
+    log.warn('match.skipped', { reason: 'import not found' });
+    return { skipped: 'import not found' };
+  }
+  if (imp.status !== 'matching') {
+    log.info('match.skipped', { reason: `import is ${imp.status}` });
+    return { skipped: `import is ${imp.status}` };
+  }
 
   const keys = await repo.pendingTrackKeys(pool, importId);
-  const results = await settlePool(chunk(keys, chunkSize), parallelism, (chunkKeys) => runChunk(chunkKeys));
+  const chunks = chunk(keys, chunkSize);
+  log.info('match.plan', { pendingTracks: keys.length, chunks: chunks.length, chunkSize, parallelism });
+  let finished = 0;
+  const results = await settlePool(chunks, parallelism, async (chunkKeys, i) => {
+    const label = `${i + 1}/${chunks.length}`;
+    const chunkStartedAt = performance.now();
+    log.info('match.chunk.started', { chunk: label, tracks: chunkKeys.length, firstKey: chunkKeys[0] });
+    try {
+      const value = await runChunk(chunkKeys);
+      finished += 1;
+      log.info('match.chunk.finished', { chunk: label, ms: since(chunkStartedAt), done: `${finished}/${chunks.length}`, ...summarizeChunkResult(value) });
+      return value;
+    } catch (err) {
+      finished += 1;
+      log.error('match.chunk.failed', { chunk: label, ms: since(chunkStartedAt), done: `${finished}/${chunks.length}`, err });
+      throw err;
+    }
+  });
 
   const authExpired = results.find((r) => r.status === 'fulfilled' && r.value?.authExpired);
   if (authExpired) {
     await repo.setStatus(pool, importId, 'failed', { error: authExpired.value.message });
+    log.warn('match.failed', { reason: 'auth_expired', ms: since(startedAt) });
     return { failed: 'auth' };
   }
   const failures = results.filter((r) => r.status === 'rejected');
@@ -90,64 +117,131 @@ export async function matchImport(deps, importId, { runChunk }) {
     // Chunks already used their own retries. Record the failure and return normally: a root
     // retry would only re-run the same chunks immediately. The user's Retry resumes later.
     await repo.setStatus(pool, importId, 'failed', { error: `Matching stopped after repeated errors (${reason}). Press Retry to resume.` });
+    log.error('match.failed', { reason, failedChunks: failures.length, ms: since(startedAt), ...counts });
     return { failed: reason, counts };
   }
   await repo.setStatus(pool, importId, 'matched');
+  log.info('match.finished', { ms: since(startedAt), chunks: chunks.length, ...counts });
   return { counts };
 }
 
 /**
  * Match up to ~100 tracks. Each result is written immediately, so a retry continues where
  * this attempt stopped.
- * @param deps { pool, clientFor(accountId), fetchImpl }
+ * @param deps { pool, clientFor(accountId, { log }), fetchImpl, log }
  */
 export async function matchChunk(deps, importId, keys) {
   const { pool, clientFor, fetchImpl = fetch } = deps;
+  const log = (deps.log || rootLog).child({ importId });
+  const startedAt = performance.now();
   const imp = await repo.getImport(pool, importId);
-  if (!imp || imp.status !== 'matching') return { skipped: true };
+  if (!imp || imp.status !== 'matching') {
+    log.info('match.chunk.skipped', { reason: imp ? `import is ${imp.status}` : 'import not found', tracks: keys.length });
+    return { skipped: true };
+  }
 
   const rows = await repo.pendingTracks(pool, importId, keys);
-  const client = clientFor(imp.account_id);
+  const client = clientFor(imp.account_id, { log });
   const cache = new Map();
   let processed = 0;
   let transient = 0;
   let lastTransient = null;
+  // Where the time goes, summed over the chunk (ms).
+  const time = { youtube: 0, tidal: 0, db: 0 };
+  const outcomes = { matched: 0, review: 0, not_found: 0, error: 0, retry_later: 0, gave_up: 0 };
+  let lookups = 0;
+
+  const summary = (extra = {}) => ({
+    keys: keys.length,
+    tracks: rows.length,
+    alreadyDone: keys.length - rows.length,
+    processed,
+    ms: since(startedAt),
+    msPerTrack: rows.length ? Math.round(since(startedAt) / rows.length) : 0,
+    youtubeLookups: lookups,
+    youtubeMs: time.youtube,
+    tidalMs: time.tidal,
+    dbMs: time.db,
+    ...outcomes,
+    tidal: { ...client.stats },
+    ...extra,
+  });
+
+  log.info('match.chunk.begin', { keys: keys.length, tracks: rows.length, firstKey: keys[0], lastKey: keys[keys.length - 1] });
 
   for (const row of rows) {
     const track = row.track;
+    const t = { youtube: 0, tidal: 0, db: 0 };
+    const requestsBefore = client.stats.requests;
+    let phase = 'youtube';
+    let phaseStart = performance.now();
+    const endPhase = (next) => {
+      const ms = since(phaseStart);
+      t[phase] += ms;
+      time[phase] += ms;
+      phase = next;
+      phaseStart = performance.now();
+    };
     try {
       if (track.needsLookup && track.source?.type === 'youtube') {
-        await enrichYouTubeTracks([track], { fetchImpl, concurrency: 1 });
+        lookups += 1;
+        await enrichYouTubeTracks([track], { fetchImpl, concurrency: 1, log });
         if (track.needsLookup && track.lookupTransient) throw new TransientError(track.lookupError);
       }
+      endPhase('tidal');
       const match = await matchTrack(client, track, { countryCode: imp.country_code || 'US', cache });
+      endPhase('db');
       await repo.saveTrackResult(pool, importId, row.key, { status: match.status, match, track });
+      endPhase(null);
       processed += 1;
+      outcomes[match.status] = (outcomes[match.status] || 0) + 1;
+      log.debug('match.track', { key: row.key, status: match.status, method: match.method, score: match.best?.score, requests: client.stats.requests - requestsBefore, youtubeMs: t.youtube, tidalMs: t.tidal, dbMs: t.db });
     } catch (err) {
-      if (isAuthError(err)) return { authExpired: true, message: authMessage(err), processed };
+      const failedIn = phase;
+      if (phase) endPhase(null);
+      if (isAuthError(err)) {
+        log.warn('match.chunk.auth_expired', summary({ key: row.key }));
+        return { authExpired: true, message: authMessage(err), processed };
+      }
       if (isTransient(err)) {
         const attempts = row.attempts + 1;
         if (attempts >= MAX_TRACK_ATTEMPTS) {
           // This one track keeps failing; give up on it rather than blocking the import.
           const match = { status: 'error', reason: `Gave up after ${attempts} attempts: ${err.message}`, best: null, alternatives: [] };
           await repo.saveTrackResult(pool, importId, row.key, { status: 'error', match, track, attempts });
+          outcomes.gave_up += 1;
+          log.warn('match.track.gave_up', { key: row.key, attempts, phase: failedIn, err });
         } else {
           await repo.saveTrackResult(pool, importId, row.key, { status: 'pending', track, attempts });
           transient += 1;
           lastTransient = err;
+          outcomes.retry_later += 1;
+          log.warn('match.track.transient_error', { key: row.key, attempts, maxAttempts: MAX_TRACK_ATTEMPTS, phase: failedIn, err });
         }
       } else {
         const match = { status: 'error', reason: err.message, best: null, alternatives: [] };
         await repo.saveTrackResult(pool, importId, row.key, { status: 'error', match, track });
+        outcomes.error += 1;
+        log.error('match.track.error', { key: row.key, phase: failedIn, err });
       }
     }
   }
 
   if (transient) {
+    log.warn('match.chunk.will_retry', summary());
     // Throwing makes Render retry this chunk with backoff; finished tracks are skipped next time.
     throw new TransientError(`${transient} track(s) hit temporary errors (last: ${lastTransient?.message}); will retry`);
   }
+  log.info('match.chunk.done', summary());
   return { processed };
+}
+
+/** The parts of a matchChunk result worth repeating in the root's log line. */
+function summarizeChunkResult(value) {
+  if (!value) return {};
+  if (value.skipped) return { skipped: true };
+  if (value.authExpired) return { authExpired: true, processed: value.processed };
+  return { processed: value.processed };
 }
 
 // ---- loading ----------------------------------------------------------------------------
@@ -159,43 +253,70 @@ export async function matchChunk(deps, importId, keys) {
  */
 export async function loadToTidal(deps, importId, { runCollection }) {
   const { pool } = deps;
+  const log = (deps.log || rootLog).child({ importId });
+  const startedAt = performance.now();
   const imp = await repo.getImport(pool, importId);
-  if (!imp) return { skipped: 'import not found' };
-  if (imp.status !== 'loading') return { skipped: `import is ${imp.status}` };
+  if (!imp) {
+    log.warn('load.skipped', { reason: 'import not found' });
+    return { skipped: 'import not found' };
+  }
+  if (imp.status !== 'loading') {
+    log.info('load.skipped', { reason: `import is ${imp.status}` });
+    return { skipped: `import is ${imp.status}` };
+  }
 
-  const targets = (await repo.getTargets(pool, importId)).filter((t) => t.status !== 'done');
+  const all = await repo.getTargets(pool, importId);
+  const targets = all.filter((t) => t.status !== 'done');
+  log.info('load.plan', { collections: all.length, remaining: targets.length, tracks: targets.reduce((n, t) => n + t.items.length, 0) });
   let gaveUp = null;
-  for (const t of targets) {
+  for (const [i, t] of targets.entries()) {
+    const fields = { collection: `${i + 1}/${targets.length}`, collectionId: t.collection_id, kind: t.kind, tracks: t.items.length };
+    const collectionStartedAt = performance.now();
+    log.info('load.collection.started', fields);
     try {
       const result = await runCollection(t.collection_id);
       if (result?.authExpired) {
         await repo.setStatus(pool, importId, 'failed', { error: result.message });
+        log.warn('load.failed', { ...fields, reason: 'auth_expired', ms: since(startedAt) });
         return { failed: 'auth' };
       }
+      log.info('load.collection.finished', { ...fields, ms: since(collectionStartedAt), ...result });
     } catch (err) {
       // writeCollection exhausted its retries. Note it and continue with the others.
       gaveUp ??= err;
+      log.error('load.collection.gave_up', { ...fields, ms: since(collectionStartedAt), err });
       await repo.updateTarget(pool, importId, t.collection_id, { error: `Stopped after repeated errors: ${err.message}. Press Retry to resume.` });
     }
   }
   if (gaveUp) {
     await repo.setStatus(pool, importId, 'failed', { error: 'Some collections could not be finished. Press Retry to resume where they stopped.' });
+    log.error('load.failed', { reason: gaveUp.message, ms: since(startedAt) });
     return { failed: gaveUp.message };
   }
   await repo.setStatus(pool, importId, 'done');
+  log.info('load.finished', { collections: targets.length, ms: since(startedAt) });
   return { done: true };
 }
 
 /** Create one playlist (or fill favourites), checkpointing after every batch. */
 export async function writeCollection(deps, importId, collectionId) {
   const { pool, clientFor } = deps;
+  const log = (deps.log || rootLog).child({ importId, collectionId });
+  const startedAt = performance.now();
   const imp = await repo.getImport(pool, importId);
-  if (!imp || imp.status !== 'loading') return { skipped: true };
+  if (!imp || imp.status !== 'loading') {
+    log.info('load.write.skipped', { reason: imp ? `import is ${imp.status}` : 'import not found' });
+    return { skipped: true };
+  }
   let t = await repo.getTarget(pool, importId, collectionId);
-  if (!t || t.status === 'done') return { skipped: true };
+  if (!t || t.status === 'done') {
+    log.info('load.write.skipped', { reason: t ? 'already done' : 'target not found' });
+    return { skipped: true };
+  }
 
-  const client = clientFor(imp.account_id);
+  const client = clientFor(imp.account_id, { log });
   const key = (...parts) => deterministicKey(importId, collectionId, ...parts);
+  let batchesDone = t.batches_done;
 
   try {
     if (t.kind === 'playlist' && !t.tidal_playlist_id) {
@@ -206,12 +327,15 @@ export async function writeCollection(deps, importId, collectionId) {
       );
       await repo.updateTarget(pool, importId, collectionId, { tidal_playlist_id: pl.id });
       t = { ...t, tidal_playlist_id: pl.id };
+      log.info('load.playlist.created', { playlistId: pl.id });
     }
 
     const batches = chunk(t.items);
     let added = t.added;
     let skipped = t.skipped;
+    log.info('load.write.begin', { kind: t.kind, playlistId: t.tidal_playlist_id, tracks: t.items.length, batches: batches.length, resumeAtBatch: t.batches_done });
     for (let i = t.batches_done; i < batches.length; i += 1) {
+      const batchStartedAt = performance.now();
       const idempotencyKey = key('batch', i, t.tidal_playlist_id || 'favorites');
       const res =
         t.kind === 'favorites'
@@ -220,12 +344,23 @@ export async function writeCollection(deps, importId, collectionId) {
       added += res.added;
       skipped += res.skipped;
       await repo.updateTarget(pool, importId, collectionId, { batches_done: i + 1, added, skipped });
+      batchesDone = i + 1;
+      log.debug('load.batch', { batch: `${i + 1}/${batches.length}`, items: batches[i].length, added: res.added, skipped: res.skipped, ms: since(batchStartedAt) });
     }
     await repo.updateTarget(pool, importId, collectionId, { status: 'done', error: null });
+    log.info('load.write.done', { added, skipped, ms: since(startedAt), tidal: { ...client.stats } });
     return { added, skipped };
   } catch (err) {
-    if (isAuthError(err)) return { authExpired: true, message: authMessage(err) };
-    if (isTransient(err)) throw err; // Render retries; we resume from the saved batch
+    const fields = { ms: since(startedAt), playlistId: t.tidal_playlist_id, batchesDone, tidal: { ...client.stats }, err };
+    if (isAuthError(err)) {
+      log.warn('load.write.auth_expired', fields);
+      return { authExpired: true, message: authMessage(err) };
+    }
+    if (isTransient(err)) {
+      log.warn('load.write.will_retry', fields);
+      throw err; // Render retries; we resume from the saved batch
+    }
+    log.error('load.write.failed', fields);
     await repo.updateTarget(pool, importId, collectionId, { status: 'failed', error: err.message });
     return { failed: err.message };
   }

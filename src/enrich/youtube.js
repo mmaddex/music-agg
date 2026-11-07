@@ -3,6 +3,7 @@
 // *video* title and channel name, so we clean them up into a likely song/artist pair.
 
 import { stripDecorations } from '../util/text.js';
+import { log as rootLog, since } from '../util/log.js';
 
 const OEMBED = 'https://www.youtube.com/oembed';
 
@@ -41,7 +42,8 @@ export function parseVideoTitle(videoTitle, channel) {
  * Enrich tracks in place. `fetchImpl` is injectable for tests.
  * Returns { enriched, failed } counts.
  */
-export async function enrichYouTubeTracks(tracks, { fetchImpl = fetch, concurrency = 4, onProgress } = {}) {
+export async function enrichYouTubeTracks(tracks, { fetchImpl = fetch, concurrency = 4, onProgress, log = rootLog } = {}) {
+  const ylog = log.child({ component: 'youtube' });
   const pending = tracks.filter((t) => t.needsLookup && t.source?.type === 'youtube');
   let enriched = 0;
   let failed = 0;
@@ -51,6 +53,8 @@ export async function enrichYouTubeTracks(tracks, { fetchImpl = fetch, concurren
     while (next < pending.length) {
       const track = pending[next];
       next += 1;
+      const startedAt = performance.now();
+      const videoId = track.source.id;
       try {
         const url = `${OEMBED}?format=json&url=${encodeURIComponent(`https://www.youtube.com/watch?v=${track.source.id}`)}`;
         const res = await fetchImpl(url, { headers: { accept: 'application/json' }, signal: AbortSignal.timeout(10_000) });
@@ -60,6 +64,7 @@ export async function enrichYouTubeTracks(tracks, { fetchImpl = fetch, concurren
           track.lookupError = gone ? 'Video is private or no longer available on YouTube' : `YouTube lookup failed (${res.status})`;
           track.lookupTransient = !gone;
           failed += 1;
+          (gone ? ylog.info : ylog.warn)('youtube.lookup.failed', { videoId, status: res.status, transient: !gone, ms: since(startedAt) });
         } else {
           const data = await res.json();
           const { title, artist } = parseVideoTitle(data.title, data.author_name);
@@ -73,11 +78,13 @@ export async function enrichYouTubeTracks(tracks, { fetchImpl = fetch, concurren
           delete track.lookupError;
           delete track.lookupTransient;
           enriched += 1;
+          ylog.debug('youtube.lookup', { videoId, ms: since(startedAt), found: Boolean(track.title) });
         }
       } catch (err) {
         track.lookupError = `YouTube lookup failed (${err.name === 'TimeoutError' ? 'timeout' : err.message})`;
         track.lookupTransient = true;
         failed += 1;
+        ylog.warn('youtube.lookup.failed', { videoId, transient: true, ms: since(startedAt), err });
       }
       onProgress?.(enriched + failed, pending.length);
     }
