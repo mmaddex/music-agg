@@ -69,7 +69,10 @@ export class TidalClient {
   url(path, query) {
     const u = new URL(this.baseUrl + path);
     for (const [k, v] of Object.entries(query || {})) {
-      if (v !== undefined && v !== null && v !== '') u.searchParams.set(k, Array.isArray(v) ? v.join(',') : String(v));
+      if (v === undefined || v === null || v === '') continue;
+      // Arrays repeat the key (OpenAPI form/explode, the spec's default): filter[id]=1&filter[id]=2
+      if (Array.isArray(v)) v.forEach((x) => u.searchParams.append(k, String(x)));
+      else u.searchParams.set(k, String(v));
     }
     return u.toString();
   }

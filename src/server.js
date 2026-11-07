@@ -30,6 +30,13 @@ class HttpError extends Error {
   }
 }
 
+/** RFC 4180 cell; a leading = + - @ is prefixed with ' so spreadsheets don't run it as a formula. */
+function csvCell(v) {
+  let s = v === null || v === undefined ? '' : String(v);
+  if (/^[=+\-@]/.test(s)) s = `'${s}`;
+  return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
 /** Build the JSON the browser polls for one import. */
 async function importView(pool, imp, { withResults = false } = {}) {
   const view = {
@@ -67,9 +74,13 @@ async function importView(pool, imp, { withResults = false } = {}) {
         skipped: t.skipped,
         error: t.error,
         url: t.kind === 'favorites' ? 'https://tidal.com/my-collection/tracks' : t.tidal_playlist_id ? `https://tidal.com/playlist/${t.tidal_playlist_id}` : null,
+        notImported: t.unimported.length,
+        albums: (t.albums || []).map((a) => ({ id: a.id, title: a.title, artists: a.artists, trackCount: a.trackCount })),
+        albumsAdded: t.albums_added,
       };
     });
     view.progress = { phase: 'Importing to TIDAL', done, total };
+    view.notImported = targets.reduce((n, t) => n + t.unimported.length, 0);
   }
   if (withResults && imp.stage) view.results = await repo.matchResults(pool, imp);
   return view;
@@ -262,6 +273,21 @@ export function createApp({ pool, dispatcher, fetchImpl = fetch }) {
     res.json(await importView(pool, imp, { withResults: req.query.results === '1' }));
   }));
 
+  // Every source track that did not end up in TIDAL, with title / artist / album and the reason.
+  app.get('/api/imports/:importId/not-imported.csv', requireLogin, wrap(async (req, res) => {
+    const imp = await loadImport(req);
+    const targets = await repo.getTargets(pool, imp.id);
+    const header = ['collection', 'title', 'artist', 'album', 'reason', 'detail', 'source_url'];
+    const lines = [header.join(',')];
+    for (const t of targets) {
+      for (const u of t.unimported) lines.push([t.name, u.title, u.artist, u.album, u.reason, u.detail, u.url].map(csvCell).join(','));
+    }
+    const base = imp.filename.replace(/\.[^.]+$/, '').replace(/[^\w.-]+/g, '_') || 'import';
+    res.set('content-type', 'text/csv; charset=utf-8');
+    res.set('content-disposition', `attachment; filename="${base}-not-imported.csv"`);
+    res.send(`\ufeff${lines.join('\r\n')}\r\n`); // BOM so Excel reads UTF-8
+  }));
+
   app.post('/api/imports/:importId/match', requireLogin, wrap(async (req, res) => {
     const imp = await loadImport(req);
     const collectionIds = Array.isArray(req.body?.collectionIds) ? req.body.collectionIds.map(String) : [];
@@ -304,7 +330,14 @@ export function createApp({ pool, dispatcher, fetchImpl = fetch }) {
       await dispatch(imp, 'matchImport', 'match');
     } else {
       await claim(imp.id, ['failed'], 'loading', 'load');
-      await pool.query(`UPDATE import_targets SET status = 'pending', error = NULL WHERE import_id = $1 AND status <> 'done'`, [imp.id]);
+      // Rows recorded because a write failed are re-attempted now, so drop them from the record.
+      await pool.query(
+        `UPDATE import_targets
+            SET status = 'pending', error = NULL,
+                unimported = COALESCE((SELECT jsonb_agg(u) FROM jsonb_array_elements(unimported) u WHERE u->>'reason' <> 'write_failed'), '[]'::jsonb)
+          WHERE import_id = $1 AND status <> 'done'`,
+        [imp.id],
+      );
       await dispatch(imp, 'loadToTidal', 'load');
     }
     res.status(202).json(await importView(pool, await repo.getImport(pool, imp.id)));

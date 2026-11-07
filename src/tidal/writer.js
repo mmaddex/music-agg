@@ -5,6 +5,8 @@
 //        { data: [{ type: "tracks", id, meta: { addedAt } }], meta: { onDuplicates } }
 //   POST /userCollectionTracks/me/relationships/items     (collection.write) ≤ 50 items per call
 //        { data: [{ type: "tracks", id, meta: { addedAt } }] }
+//   POST /userCollectionAlbums/me/relationships/items     (collection.write) ≤ 50 items per call
+//        { data: [{ type: "albums", id }] }
 //
 // Each function performs ONE write so the caller (a workflow task) can checkpoint between
 // writes. Callers pass a deterministic `idempotencyKey`: if a retried task re-sends a write
@@ -52,9 +54,12 @@ export async function createPlaylist(client, { name, description, createdAt, acc
 }
 
 // Responses list items TIDAL did not add in meta.skipped (reason ALREADY_PRESENT / NOT_FOUND).
+// NOT_FOUND = not available to this account/country: those ids are returned so the caller can
+// record them as not imported.
 function outcome(doc, sent) {
-  const skipped = Array.isArray(doc?.meta?.skipped) ? doc.meta.skipped.length : 0;
-  return { added: Math.max(0, sent - skipped), skipped };
+  const list = Array.isArray(doc?.meta?.skipped) ? doc.meta.skipped : [];
+  const notFound = list.filter((s) => s.reason === 'NOT_FOUND').map((s) => String(s.id));
+  return { added: Math.max(0, sent - list.length), skipped: list.length, notFound };
 }
 
 /** Add up to BATCH_SIZE tracks to a playlist. items: [{ id, addedAt? }] → { added, skipped } */
@@ -70,4 +75,11 @@ export async function addFavoritesBatch(client, items, { idempotencyKey } = {}) 
   const send = (data, key) => client.post('/userCollectionTracks/me/relationships/items', { data }, { idempotencyKey: key });
   const doc = await withDateFallback(send, itemData(items), hasDates(items) ? itemData(items, { withDates: false }) : null, idempotencyKey);
   return outcome(doc, items.length);
+}
+
+/** Save up to BATCH_SIZE albums to My Collection › Albums. albumIds: string[] */
+export async function addAlbumsBatch(client, albumIds, { idempotencyKey } = {}) {
+  const data = albumIds.map((id) => ({ type: 'albums', id: String(id) }));
+  const doc = await client.post('/userCollectionAlbums/me/relationships/items', { data }, { idempotencyKey });
+  return outcome(doc, albumIds.length);
 }

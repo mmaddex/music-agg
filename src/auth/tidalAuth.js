@@ -16,7 +16,8 @@ export const TOKEN_URL = 'https://auth.tidal.com/v1/oauth2/token';
 //   user.read        GET /users/me (username, country for catalogue lookups)
 //   search.read      GET /searchResults
 //   playlists.write  POST /playlists, POST /playlists/{id}/relationships/items
-//   collection.write POST /userCollectionTracks/me/relationships/items
+//   collection.write POST /userCollectionTracks/me/relationships/items,
+//                    POST /userCollectionAlbums/me/relationships/items
 export const SCOPES = ['user.read', 'search.read', 'playlists.write', 'collection.write'];
 
 const b64url = (buf) => buf.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');

@@ -4,7 +4,7 @@ import crypto from 'node:crypto';
 import { buildAuthorizeUrl, createPkcePair, exchangeCode, refreshTokens, SCOPES } from '../src/auth/tidalAuth.js';
 import { TidalClient } from '../src/tidal/client.js';
 import { matchTrack, scoreCandidate } from '../src/tidal/matcher.js';
-import { addFavoritesBatch, addPlaylistBatch, chunk, createPlaylist } from '../src/tidal/writer.js';
+import { addAlbumsBatch, addFavoritesBatch, addPlaylistBatch, chunk, createPlaylist } from '../src/tidal/writer.js';
 import { makeTrack } from '../src/importers/model.js';
 
 const noSleep = async () => {};
@@ -208,7 +208,7 @@ test("playlist batch uses the documented body and the caller's idempotency key",
   const batches = chunk(items);
   assert.deepEqual(batches.map((b) => b.length), [50, 50, 20]);
   const res = await addPlaylistBatch(client, 'pl-1', batches[0], { idempotencyKey: 'k-1' });
-  assert.deepEqual(res, { added: 50, skipped: 0 });
+  assert.deepEqual(res, { added: 50, skipped: 0, notFound: [] });
   assert.equal(client.posts[0].path, '/playlists/pl-1/relationships/items');
   assert.equal(client.posts[0].idempotencyKey, 'k-1');
   assert.deepEqual(client.posts[0].body.data[0], { type: 'tracks', id: '0', meta: { addedAt: '2020-01-01T00:00:00Z' } });
@@ -218,8 +218,28 @@ test("playlist batch uses the documented body and the caller's idempotency key",
 test('favourites batch counts tracks TIDAL reports as already present', async () => {
   const client = recordingClient({ skipped: [{ id: '1', type: 'tracks', reason: 'ALREADY_PRESENT' }] });
   const res = await addFavoritesBatch(client, [{ id: '1' }, { id: '2' }], { idempotencyKey: 'k' });
-  assert.deepEqual(res, { added: 1, skipped: 1 });
+  assert.deepEqual(res, { added: 1, skipped: 1, notFound: [] });
   assert.equal(client.posts[0].path, '/userCollectionTracks/me/relationships/items');
+});
+
+test('tracks TIDAL reports as NOT_FOUND are returned so they can be recorded', async () => {
+  const client = recordingClient({ skipped: [{ id: '2', type: 'tracks', reason: 'NOT_FOUND' }, { id: '3', type: 'tracks', reason: 'ALREADY_PRESENT' }] });
+  const res = await addFavoritesBatch(client, [{ id: '1' }, { id: '2' }, { id: '3' }], { idempotencyKey: 'k' });
+  assert.deepEqual(res, { added: 1, skipped: 2, notFound: ['2'] });
+});
+
+test('albums are saved with the documented body', async () => {
+  const client = recordingClient();
+  const res = await addAlbumsBatch(client, ['10', 11], { idempotencyKey: 'a-0' });
+  assert.deepEqual(res, { added: 2, skipped: 0, notFound: [] });
+  assert.equal(client.posts[0].path, '/userCollectionAlbums/me/relationships/items');
+  assert.deepEqual(client.posts[0].body, { data: [{ type: 'albums', id: '10' }, { type: 'albums', id: '11' }] });
+  assert.equal(client.posts[0].idempotencyKey, 'a-0');
+});
+
+test('array query parameters repeat the key, as the TIDAL spec expects', () => {
+  const c = new TidalClient({ getAccessToken: async () => 'x' });
+  assert.equal(c.url('/tracks', { 'filter[id]': ['1', '2'], include: 'albums' }), 'https://openapi.tidal.com/v2/tracks?filter%5Bid%5D=1&filter%5Bid%5D=2&include=albums');
 });
 
 test('dates are dropped and retried (with a different key) if TIDAL rejects them', async () => {

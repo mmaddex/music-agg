@@ -60,7 +60,7 @@ CREATE TABLE IF NOT EXISTS import_targets (
   name               text NOT NULL,
   description        text,
   created_at_source  text,
-  items              jsonb NOT NULL,         -- [{ id, addedAt }] TIDAL track ids, in order
+  items              jsonb NOT NULL,         -- [{ id, addedAt, key, albumId }] TIDAL track ids, in order
   tidal_playlist_id  text,
   batches_done       integer NOT NULL DEFAULT 0,
   added              integer NOT NULL DEFAULT 0,
@@ -70,3 +70,13 @@ CREATE TABLE IF NOT EXISTS import_targets (
   updated_at         timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (import_id, collection_id)
 );
+
+-- Added later; ADD COLUMN IF NOT EXISTS keeps existing databases in step.
+--   unimported:  source tracks of this collection that did not end up in TIDAL, with the reason
+--                [{ key, title, artist, album, url, reason, detail }]
+--   albums:      favourites only: albums saved whole instead of as loose tracks
+--                [{ id, title, artists, trackCount }]; NULL = not worked out yet
+ALTER TABLE import_targets ADD COLUMN IF NOT EXISTS unimported jsonb NOT NULL DEFAULT '[]';
+ALTER TABLE import_targets ADD COLUMN IF NOT EXISTS albums jsonb;
+ALTER TABLE import_targets ADD COLUMN IF NOT EXISTS albums_done integer NOT NULL DEFAULT 0;
+ALTER TABLE import_targets ADD COLUMN IF NOT EXISTS albums_added integer NOT NULL DEFAULT 0;

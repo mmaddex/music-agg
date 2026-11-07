@@ -148,4 +148,14 @@ test('full flow: login → upload → match workflow → review → load workflo
   assert.equal(done.targets[1].url, 'https://tidal.com/playlist/PL');
   const creates = up.log.filter((l) => l.method === 'POST' && l.url.pathname === '/v2/playlists');
   assert.equal(creates.length, 1, 'the playlist was created exactly once across the failure and retry');
+
+  // The "not imported" record: everything was imported here, and the failed write's rows were
+  // cleared by Retry.
+  assert.equal(done.notImported, 0);
+  const csv = await call(`/api/imports/${up1.id}/not-imported.csv`);
+  assert.equal(csv.status, 200);
+  assert.match(csv.headers.get('content-type'), /^text\/csv/);
+  assert.match(csv.headers.get('content-disposition'), /filename="export-not-imported\.csv"/);
+  const bytes = Buffer.from(await csv.arrayBuffer());
+  assert.equal(bytes.toString('utf8'), '\ufeffcollection,title,artist,album,reason,detail,source_url\r\n', 'UTF-8 BOM so Excel opens it correctly');
 });

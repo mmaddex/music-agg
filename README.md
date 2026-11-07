@@ -76,10 +76,48 @@ Scopes requested: `user.read search.read playlists.write collection.write`.
 | Create playlist | `POST /playlists` (created as `UNLISTED`) |
 | Add playlist tracks | `POST /playlists/{id}/relationships/items` (≤ 50 per call) |
 | Add favourites | `POST /userCollectionTracks/me/relationships/items` (≤ 50; already-saved tracks come back in `meta.skipped`) |
+| Save whole albums | `POST /userCollectionAlbums/me/relationships/items` (≤ 50) |
+| Album of a track | `GET /tracks?filter[id]=…&include=albums` (≤ 20 ids; only for matches saved before album ids were recorded) |
+| Album track list | `GET /albums/{id}?include=items,artists`, then `GET /albums/{id}/relationships/items?page[cursor]=…` |
 
 Matching scores each candidate on title, artist, album, duration and version markers
 (live / remix / karaoke …). Each track ends up *matched* (imported by default), *needs review*
 (you decide; there's a bulk "accept suggestions" button) or *not found*.
+
+### Whole albums (favourites only)
+
+Before adding your liked songs, the load step groups them by the TIDAL album each one matched
+to. If **every** track TIDAL lists on an album is in your liked songs, the album is saved to
+My Collection › Albums and those tracks are **not** also added one by one. Everything else is
+added as individual favourite tracks.
+
+* Singles are never saved as albums, and an album needs at least 2 tracks.
+* "Every track" is judged by TIDAL track id. If some songs matched a different release of the
+  album (deluxe edition, compilation, single), the album isn't complete and its tracks are added
+  individually.
+* Playlists are not affected: a playlist keeps its tracks in order.
+* If album lookups fail permanently, the tracks are added individually (`load.albums.plan_failed`
+  in the logs). If TIDAL refuses an album when saving it, its tracks are added instead.
+
+The done screen lists the albums saved for each collection.
+
+### Tracks that weren't imported
+
+Every source track that didn't end up in TIDAL is recorded on its collection with title,
+artist, album, source link and a reason:
+
+| Reason | Meaning |
+| ------ | ------- |
+| `not_found_on_tidal` | no match on TIDAL |
+| `match_not_accepted` | only a possible match was found and it wasn't accepted on the review screen |
+| `excluded_by_you` | you unticked it on the review screen |
+| `match_error` | matching kept failing for this track |
+| `unavailable_on_tidal` | TIDAL refused it at write time (`NOT_FOUND`: not available for your account/country) |
+| `write_failed` | the collection stopped after repeated errors; cleared when you press Retry |
+
+The done screen shows the count and a **Download the list (CSV)** link
+(`GET /api/imports/{id}/not-imported.csv`). The record is deleted with the import after
+`IMPORT_RETENTION_DAYS` (default 30), so download the CSV to keep it.
 
 ### About the YouTube Music export
 
@@ -184,6 +222,8 @@ every task run; `taskRunId=<trn-…>` matches a run in the Workflow dashboard.
 | `tidal.request.retry` / `gave_up` | workflow | every TIDAL retry: status, attempt, wait, `Retry-After` |
 | `youtube.lookup.failed` | workflow | video id, status, whether it will be retried |
 | `load.plan`, `load.collection.*`, `load.write.*`, `load.playlist.created` | load tasks | per collection: playlist id, batches written, added/skipped, failures |
+| `load.albums.planned` / `saved` / `unavailable` / `plan_failed` | `writeCollection` | albums checked, saved whole, tracks they cover; `load.album.checked` (debug) per album with how many tracks were missing |
+| `load.tracks.unavailable` | `writeCollection` | tracks TIDAL refused, recorded as not imported |
 
 `LOG_LEVEL=debug` adds one line per TIDAL request (`tidal.request`), per matched track
 (`match.track`, with its timings and request count), per YouTube lookup and per 50-track

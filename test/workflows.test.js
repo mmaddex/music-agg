@@ -212,6 +212,82 @@ test('loadToTidal writes every collection and finishes the import', { skip: !has
   assert.equal(JSON.parse(created.init.body).data.attributes.name, 'Road Trip (TIDAL)');
 });
 
+test('favourites: complete albums are saved whole, and tracks that are not imported are recorded', { skip: !hasDb }, async (t) => {
+  const db = await testPool();
+  t.after(() => db.close());
+  const account = await upsertAccount(db.pool, { tidalUserId: `u-${Math.random()}`, username: 'matt', country: 'US', tokens: { accessToken: 'AT', refreshToken: 'RT', expiresAt: Date.now() + 3_600_000 } });
+  const tr = (title, album = 'Some Album') => makeTrack({ title, artistCredit: 'Band', album, source: { type: 'youtube', id: title, url: `https://music.youtube.com/watch?v=${title}` } });
+  const titles = ['A1', 'A2', 'B1', 'S1', 'S2', 'C1', 'C2', 'N', 'R', 'X'];
+  const library = { format: 'test', formatLabel: 'Test', warnings: [], collections: [makeCollection({ id: 'f', kind: 'favorites', name: 'Liked', tracks: titles.map((x) => tr(x, `Album of ${x}`)) })] };
+  const id = await repo.createImport(db.pool, { accountId: account.id, filename: 'my export.zip', library });
+  await repo.prepareMatch(db.pool, await repo.getImport(db.pool, id), ['f'], 'US');
+
+  // Matches: albumId recorded for most; C1/C2 were matched before album ids existed.
+  const albumOf = { A1: 'ALB-FULL', A2: 'ALB-FULL', B1: 'ALB-PART', S1: 'ALB-SINGLE', S2: 'ALB-SINGLE', X: 'ALB-X' };
+  const { rows } = await db.pool.query('SELECT key, track FROM import_tracks WHERE import_id = $1', [id]);
+  for (const r of rows) {
+    const title = r.track.title;
+    const match =
+      title === 'N' ? { status: 'not_found', reason: 'No results on TIDAL', best: null, alternatives: [] }
+      : title === 'R' ? { status: 'review', best: { id: 'T-R', title: 'R (Live)', artists: ['Band'], score: 0.7 }, alternatives: [] }
+      : { status: 'matched', best: { id: `T-${title}`, title, artists: ['Band'], albumId: albumOf[title] ?? null }, alternatives: [] };
+    await db.pool.query('UPDATE import_tracks SET status = $3, match = $4 WHERE import_id = $1 AND key = $2', [id, r.key, match.status, JSON.stringify(match)]);
+  }
+  await repo.setStatus(db.pool, id, 'matched');
+  await repo.prepareLoad(db.pool, await repo.getImport(db.pool, id), [{ id: 'f' }], {});
+
+  const albums = {
+    'ALB-FULL': { title: 'Full Album', type: 'ALBUM', pages: [['T-A1'], ['T-A2']] }, // two pages: exercises links.next
+    'ALB-PART': { title: 'Partial', type: 'ALBUM', pages: [['T-B1', 'T-B2']] },
+    'ALB-SINGLE': { title: 'A Single', type: 'SINGLE', pages: [['T-S1', 'T-S2']] },
+    'ALB-OLD': { title: 'Old Match', type: 'EP', pages: [['T-C1', 'T-C2']] },
+  };
+  const calls = [];
+  const fetchImpl = async (url, init = {}) => {
+    const u = new URL(url);
+    calls.push({ method: init.method || 'GET', u, body: init.body ? JSON.parse(init.body) : null });
+    if (u.pathname === '/v2/tracks') {
+      const ids = u.searchParams.getAll('filter[id]');
+      return json({ data: ids.map((tid) => ({ id: tid, type: 'tracks', relationships: { albums: { data: [{ id: 'ALB-OLD', type: 'albums' }] } } })) });
+    }
+    const page = /^\/v2\/albums\/([^/]+)(\/relationships\/items)?$/.exec(u.pathname);
+    if (page) {
+      const a = albums[page[1]];
+      const n = Number(u.searchParams.get('page[cursor]') || 0);
+      const refs = a.pages[n].map((tid) => ({ id: tid, type: 'tracks', meta: { trackNumber: 1, volumeNumber: 1 } }));
+      const next = a.pages[n + 1] ? `/albums/${page[1]}/relationships/items?page[cursor]=${n + 1}` : undefined;
+      if (page[2]) return json({ data: refs, links: { self: u.pathname, next } });
+      return json({ data: { id: page[1], type: 'albums', attributes: { title: a.title, albumType: a.type }, relationships: { items: { data: refs, links: { self: 'x', next } }, artists: { data: [{ id: 'ar', type: 'artists' }] } } }, included: [{ id: 'ar', type: 'artists', attributes: { name: 'Band' } }] });
+    }
+    if (u.pathname === '/v2/userCollectionAlbums/me/relationships/items') return json({ meta: { skipped: [] } });
+    if (u.pathname === '/v2/userCollectionTracks/me/relationships/items') return json({ meta: { skipped: [{ id: 'T-X', type: 'tracks', reason: 'NOT_FOUND' }] } });
+    return json({ errors: [{ detail: `unexpected ${u}` }] }, 404);
+  };
+  const deps = buildDeps({ pool: db.pool, fetchImpl, settings: { minIntervalMs: 0 }, clientOptions: fastClient });
+  const res = await steps.writeCollection(deps, id, 'f');
+
+  const albumPosts = calls.filter((c) => c.u.pathname === '/v2/userCollectionAlbums/me/relationships/items');
+  assert.deepEqual(albumPosts.flatMap((c) => c.body.data.map((d) => d.id)).sort(), ['ALB-FULL', 'ALB-OLD'], 'only complete, non-single albums are saved');
+  const trackPosts = calls.filter((c) => c.u.pathname === '/v2/userCollectionTracks/me/relationships/items');
+  assert.deepEqual(trackPosts.flatMap((c) => c.body.data.map((d) => d.id)).sort(), ['T-B1', 'T-S1', 'T-S2', 'T-X'], 'tracks of saved albums are not added one by one');
+  assert.deepEqual(res, { added: 3, skipped: 3, albumsAdded: 2 }); // skipped: N + R (no match) + X (refused)
+
+  const target = await repo.getTarget(db.pool, id, 'f');
+  assert.equal(target.status, 'done');
+  assert.deepEqual(target.albums.map((a) => [a.title, a.trackCount, a.artists]).sort(), [['Full Album', 2, ['Band']], ['Old Match', 2, ['Band']]]);
+  const byTitle = Object.fromEntries(target.unimported.map((u) => [u.title, u]));
+  assert.deepEqual(Object.keys(byTitle).sort(), ['N', 'R', 'X']);
+  assert.equal(byTitle.N.reason, 'not_found_on_tidal');
+  assert.equal(byTitle.R.reason, 'match_not_accepted');
+  assert.match(byTitle.R.detail, /R \(Live\) by Band/);
+  assert.deepEqual(byTitle.X, { key: byTitle.X.key, title: 'X', artist: 'Band', album: 'Album of X', url: 'https://music.youtube.com/watch?v=X', reason: 'unavailable_on_tidal', detail: 'TIDAL refused this track (not available for your account or country)' });
+
+  // A retry after success does nothing more (no duplicate album or track writes, no duplicate rows).
+  await steps.writeCollection(deps, id, 'f');
+  assert.equal(calls.filter((c) => c.method === 'POST').length, albumPosts.length + trackPosts.length);
+  assert.equal((await repo.getTarget(db.pool, id, 'f')).unimported.length, 3);
+});
+
 test('the Workflow entry point registers all tasks with their retry options', async () => {
   const { TaskRegistry } = await import('@renderinc/sdk/workflows');
   await import('../src/workflows/main.js');

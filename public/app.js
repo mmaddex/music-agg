@@ -398,12 +398,22 @@ function showDone(view) {
           'li',
           {},
           c.url ? h('a', { href: c.url, target: '_blank', rel: 'noopener' }, c.name) : c.name,
-          ` — ${c.added} added`,
-          c.skipped ? `, ${c.skipped} skipped` : '',
+          ` — ${c.added} tracks added`,
+          c.albums?.length ? `, ${c.albums.length} full album${c.albums.length === 1 ? '' : 's'} saved` : '',
+          c.notImported ? `, ${c.notImported} not imported` : '',
+          c.albums?.length
+            ? h('details', {}, h('summary', {}, 'Albums saved whole'), h('ul', {}, ...c.albums.map((a) => h('li', {}, `${a.title}${a.artists?.length ? ` — ${a.artists.join(', ')}` : ''} (${a.trackCount} tracks)`))))
+            : null,
           c.error ? h('div', { class: 'err' }, c.error) : null,
         ),
       ),
     );
+  const missing = view.notImported || 0;
+  $('#done-not-imported').replaceChildren(
+    missing
+      ? h('p', {}, `${missing} track${missing === 1 ? '' : 's'} couldn't be imported. `, h('a', { href: `/api/imports/${view.id}/not-imported.csv` }, 'Download the list (CSV)'), ' — title, artist, album and the reason for each.')
+      : h('p', { class: 'muted' }, 'Every selected track was imported.'),
+  );
   show('done');
 }
 

@@ -21,7 +21,8 @@ import { AuthExpiredError } from '../accounts.js';
 import { deterministicKey } from '../crypto.js';
 import { enrichYouTubeTracks } from '../enrich/youtube.js';
 import { matchTrack } from '../tidal/matcher.js';
-import { addFavoritesBatch, addPlaylistBatch, chunk, createPlaylist } from '../tidal/writer.js';
+import { addAlbumsBatch, addFavoritesBatch, addPlaylistBatch, chunk, createPlaylist } from '../tidal/writer.js';
+import { planAlbums } from '../tidal/albums.js';
 import * as repo from '../imports/repo.js';
 import { log as rootLog, since } from '../util/log.js';
 
@@ -298,7 +299,16 @@ export async function loadToTidal(deps, importId, { runCollection }) {
   return { done: true };
 }
 
-/** Create one playlist (or fill favourites), checkpointing after every batch. */
+/**
+ * Create one playlist (or fill favourites), checkpointing after every write.
+ *
+ * Favourites: first works out which albums are present in full (planAlbums) and saves the plan,
+ * then saves those albums, then adds the remaining tracks. Tracks of a saved album aren't also
+ * added one by one.
+ *
+ * Tracks TIDAL reports as NOT_FOUND, and tracks left unwritten when a collection fails for
+ * good, are appended to the collection's "not imported" record.
+ */
 export async function writeCollection(deps, importId, collectionId) {
   const { pool, clientFor } = deps;
   const log = (deps.log || rootLog).child({ importId, collectionId });
@@ -316,7 +326,19 @@ export async function writeCollection(deps, importId, collectionId) {
 
   const client = clientFor(imp.account_id, { log });
   const key = (...parts) => deterministicKey(importId, collectionId, ...parts);
+  const countryCode = imp.country_code || 'US';
   let batchesDone = t.batches_done;
+
+  // Describe tracks (by TIDAL id, from this collection's items) for the "not imported" record.
+  const describe = async (ids, reason, detail) => {
+    const wanted = new Set(ids.map(String));
+    const items = t.items.filter((i) => wanted.has(String(i.id)));
+    const src = await repo.sourceTracks(pool, importId, items.map((i) => i.key).filter(Boolean));
+    return items.map((i) => {
+      const tr = src.get(i.key);
+      return repo.notImported(tr, i.key || null, { reason, detail: detail || `TIDAL track ${i.id}` });
+    });
+  };
 
   try {
     if (t.kind === 'playlist' && !t.tidal_playlist_id) {
@@ -330,10 +352,49 @@ export async function writeCollection(deps, importId, collectionId) {
       log.info('load.playlist.created', { playlistId: pl.id });
     }
 
+    // ---- favourites: whole albums ----
+    if (t.kind === 'favorites' && t.albums === null && t.batches_done === 0) {
+      const planStartedAt = performance.now();
+      let plan;
+      try {
+        plan = await planAlbums(client, t.items, { countryCode, log });
+      } catch (err) {
+        if (isAuthError(err) || isTransient(err)) throw err;
+        // Album lookups failing for good must not block favourites: add every track instead.
+        log.warn('load.albums.plan_failed', { err, action: 'adding all tracks individually' });
+        plan = { albums: [], items: t.items, checked: 0 };
+      }
+      // Saved in one statement: the album list and the reduced track list replace each other.
+      await repo.updateTarget(pool, importId, collectionId, { albums: JSON.stringify(plan.albums), items: JSON.stringify(plan.items) });
+      log.info('load.albums.planned', { albumsChecked: plan.checked, wholeAlbums: plan.albums.length, tracksInAlbums: t.items.length - plan.items.length, looseTracks: plan.items.length, ms: since(planStartedAt) });
+      t = { ...t, albums: plan.albums, items: plan.items };
+    }
+    let albumsAdded = t.albums_added;
+    if (t.kind === 'favorites' && t.albums?.length) {
+      const albumBatches = chunk(t.albums.map((a) => a.id));
+      for (let i = t.albums_done; i < albumBatches.length; i += 1) {
+        const res = await addAlbumsBatch(client, albumBatches[i], { idempotencyKey: key('albums', i) });
+        albumsAdded += res.added;
+        await repo.updateTarget(pool, importId, collectionId, { albums_done: i + 1, albums_added: albumsAdded });
+        log.info('load.albums.saved', { batch: `${i + 1}/${albumBatches.length}`, albums: albumBatches[i].length, added: res.added, alreadySaved: res.skipped - res.notFound.length, unavailable: res.notFound.length });
+        if (res.notFound.length) {
+          // Rare (album withdrawn between planning and saving): add its tracks individually
+          // instead. Safe to change the track list here: no track batch has been written yet.
+          const gone = new Set(res.notFound);
+          const lost = t.albums.filter((a) => gone.has(String(a.id)));
+          const fallback = lost.flatMap((a) => a.items || []);
+          t = { ...t, items: [...t.items, ...fallback] };
+          await repo.updateTarget(pool, importId, collectionId, { items: JSON.stringify(t.items) });
+          log.warn('load.albums.unavailable', { albumIds: res.notFound.join(','), titles: lost.map((a) => a.title).join(' | '), tracksAddedInstead: fallback.length });
+        }
+      }
+    }
+
+    // ---- tracks ----
     const batches = chunk(t.items);
     let added = t.added;
     let skipped = t.skipped;
-    log.info('load.write.begin', { kind: t.kind, playlistId: t.tidal_playlist_id, tracks: t.items.length, batches: batches.length, resumeAtBatch: t.batches_done });
+    log.info('load.write.begin', { kind: t.kind, playlistId: t.tidal_playlist_id, tracks: t.items.length, albums: t.albums?.length ?? 0, batches: batches.length, resumeAtBatch: t.batches_done });
     for (let i = t.batches_done; i < batches.length; i += 1) {
       const batchStartedAt = performance.now();
       const idempotencyKey = key('batch', i, t.tidal_playlist_id || 'favorites');
@@ -343,13 +404,15 @@ export async function writeCollection(deps, importId, collectionId) {
           : await addPlaylistBatch(client, t.tidal_playlist_id, batches[i], { idempotencyKey });
       added += res.added;
       skipped += res.skipped;
-      await repo.updateTarget(pool, importId, collectionId, { batches_done: i + 1, added, skipped });
+      const unavailable = res.notFound.length ? await describe(res.notFound, 'unavailable_on_tidal', 'TIDAL refused this track (not available for your account or country)') : [];
+      await repo.updateTargetAndRecord(pool, importId, collectionId, { batches_done: i + 1, added, skipped }, unavailable);
       batchesDone = i + 1;
+      if (unavailable.length) log.warn('load.tracks.unavailable', { batch: `${i + 1}/${batches.length}`, count: unavailable.length, trackIds: res.notFound.join(',') });
       log.debug('load.batch', { batch: `${i + 1}/${batches.length}`, items: batches[i].length, added: res.added, skipped: res.skipped, ms: since(batchStartedAt) });
     }
     await repo.updateTarget(pool, importId, collectionId, { status: 'done', error: null });
-    log.info('load.write.done', { added, skipped, ms: since(startedAt), tidal: { ...client.stats } });
-    return { added, skipped };
+    log.info('load.write.done', { added, skipped, albumsAdded, ms: since(startedAt), tidal: { ...client.stats } });
+    return t.kind === 'favorites' ? { added, skipped, albumsAdded } : { added, skipped };
   } catch (err) {
     const fields = { ms: since(startedAt), playlistId: t.tidal_playlist_id, batchesDone, tidal: { ...client.stats }, err };
     if (isAuthError(err)) {
@@ -361,7 +424,10 @@ export async function writeCollection(deps, importId, collectionId) {
       throw err; // Render retries; we resume from the saved batch
     }
     log.error('load.write.failed', fields);
-    await repo.updateTarget(pool, importId, collectionId, { status: 'failed', error: err.message });
+    // Everything not yet written goes on the record (Retry clears these rows and resumes).
+    const left = t.items.slice(batchesDone * 50).map((i) => i.id);
+    const unwritten = await describe(left, 'write_failed', err.message);
+    await repo.updateTargetAndRecord(pool, importId, collectionId, { status: 'failed', error: err.message }, unwritten);
     return { failed: err.message };
   }
 }

@@ -81,6 +81,7 @@ const summarize = (cand, score) => ({
   version: cand.version,
   artists: cand.artists,
   album: cand.albums[0] || null,
+  albumId: cand.albumId ?? null,
   durationMs: cand.durationMs,
   score,
 });
