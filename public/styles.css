@@ -108,3 +108,15 @@ details.coll .table-wrap { overflow-x: auto; padding: 0 8px 8px; }
 .failed { margin-top: 12px; padding: 12px; border-radius: 8px; border: 1px solid var(--bad); background: color-mix(in srgb, var(--bad) 8%, var(--card)); }
 .failed p { margin: 0; }
 .meta.err { color: var(--bad); }
+
+.recent-head { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.recent-head .link { font-size: 13px; }
+.missing-controls { display: flex; gap: 8px; flex-wrap: wrap; margin: 12px 0; }
+.missing-controls input, .missing-controls select { padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--text); font: inherit; font-size: 14px; }
+.missing-controls input { flex: 1 1 240px; min-width: 0; }
+.missing-table .place { font-size: 13px; }
+.missing-table td:last-child > div + div { margin-top: 4px; }
+.missing-table a { color: inherit; }
+@media (max-width: 640px) {
+  .missing-controls select { flex: 1 1 140px; }
+}

@@ -39,7 +39,10 @@
           <ul id="formats"></ul>
         </details>
         <div id="recent" class="recent" hidden>
-          <h3>Recent imports</h3>
+          <div class="recent-head">
+            <h3>Recent imports</h3>
+            <button id="btn-missing" class="link">Songs missing from TIDAL, across all imports →</button>
+          </div>
           <ul id="recent-list"></ul>
         </div>
       </section>
@@ -104,7 +107,38 @@
         <h2>Done</h2>
         <ul id="done-list" class="done-list"></ul>
         <div id="done-not-imported"></div>
-        <button id="btn-again" class="button">Import another export</button>
+        <div class="actions">
+          <button id="btn-done-missing" class="button">All missing songs</button>
+          <button id="btn-again" class="button primary">Import another export</button>
+        </div>
+      </section>
+
+      <!-- Missing songs, across every import -->
+      <section id="step-missing" class="card" hidden>
+        <h2>Songs missing from TIDAL</h2>
+        <p class="muted small">
+          Every song from your imports that didn't make it to TIDAL, merged across exports. A song that another import
+          did add is left out. Imports are kept for 30 days.
+        </p>
+        <div id="missing-stats" class="stats"></div>
+        <div class="missing-controls">
+          <input id="missing-search" type="search" placeholder="Search title, artist, album or playlist" />
+          <select id="missing-source"><option value="">All sources</option></select>
+          <select id="missing-reason"><option value="">All reasons</option></select>
+        </div>
+        <div class="table-wrap">
+          <table class="track-table missing-table">
+            <thead>
+              <tr><th>Song</th><th>Missing from</th><th>Reason</th></tr>
+            </thead>
+            <tbody id="missing-rows"></tbody>
+          </table>
+        </div>
+        <div class="actions">
+          <span id="missing-count" class="muted small"></span>
+          <a class="button" href="/api/missing.csv">Download CSV</a>
+          <button id="btn-missing-back" class="button">Back</button>
+        </div>
       </section>
     </main>
 

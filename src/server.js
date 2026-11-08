@@ -365,6 +365,25 @@ export function createApp({ pool, dispatcher, fetchImpl = fetch }) {
     res.send(`\ufeff${lines.join('\r\n')}\r\n`); // BOM so Excel reads UTF-8
   }));
 
+  // Songs still missing from TIDAL across all of this account's imports (see missingAcrossImports).
+  app.get('/api/missing', requireLogin, wrap(async (req, res) => {
+    res.json({ songs: await repo.missingAcrossImports(pool, req.account.id) });
+  }));
+
+  app.get('/api/missing.csv', requireLogin, wrap(async (req, res) => {
+    const songs = await repo.missingAcrossImports(pool, req.account.id);
+    const header = ['title', 'artist', 'album', 'source', 'export', 'collection', 'reason', 'detail', 'source_url', 'audio_file'];
+    const lines = [header.join(',')];
+    for (const s of songs) {
+      for (const p of s.places) {
+        lines.push([s.title, s.artist, s.album, p.formatLabel, p.filename, p.collection, p.reason, p.detail, p.url, p.audioFile].map(csvCell).join(','));
+      }
+    }
+    res.set('content-type', 'text/csv; charset=utf-8');
+    res.set('content-disposition', 'attachment; filename="missing-songs.csv"');
+    res.send(`﻿${lines.join('\r\n')}\r\n`);
+  }));
+
   app.post('/api/imports/:importId/match', requireLogin, wrap(async (req, res) => {
     const imp = await loadImport(req);
     const collectionIds = Array.isArray(req.body?.collectionIds) ? req.body.collectionIds.map(String) : [];

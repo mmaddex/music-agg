@@ -4,7 +4,7 @@
 // All user/track text is inserted with textContent (exports are untrusted input).
 
 const $ = (sel) => document.querySelector(sel);
-const STEPS = ['login', 'upload', 'select', 'progress', 'review', 'done'];
+const STEPS = ['login', 'upload', 'select', 'progress', 'review', 'done', 'missing'];
 
 const state = {
   me: null,
@@ -15,6 +15,7 @@ const state = {
   decisions: {}, // trackKey -> tidal track id | null
   filter: 'all',
   pollToken: 0,
+  missing: null, // songs from /api/missing
 };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const STATUS_LABEL = { parsed: 'Uploaded', matching: 'Matching…', matched: 'Ready to review', loading: 'Importing…', done: 'Done', failed: 'Failed' };
@@ -446,6 +447,101 @@ function showDone(view) {
   show('done');
 }
 
+// ---- missing songs, across all imports ------------------------------------------------
+
+const REASON_LABEL = {
+  not_found_on_tidal: 'Not found on TIDAL',
+  match_not_accepted: 'Match not accepted',
+  excluded_by_you: 'Excluded by you',
+  match_error: 'Matching error',
+  not_matched: 'Not matched',
+  unavailable_on_tidal: 'Unavailable on TIDAL',
+  write_failed: 'Write failed',
+  own_audio_file: 'Your own audio file',
+};
+const reasonLabel = (r) => REASON_LABEL[r] || r;
+
+async function openMissing() {
+  flash('');
+  state.pollToken += 1;
+  show('missing');
+  $('#missing-rows').replaceChildren(h('tr', {}, h('td', { colspan: '3', class: 'muted' }, 'Loading…')));
+  try {
+    const { songs } = await api('/api/missing');
+    state.missing = songs;
+    const fill = (sel, values, label) => {
+      const current = sel.value;
+      sel.replaceChildren(sel.options[0], ...values.map((v) => h('option', { value: v }, label(v))));
+      sel.value = values.includes(current) ? current : '';
+    };
+    fill($('#missing-source'), [...new Set(songs.flatMap((s) => s.places.map((p) => p.formatLabel)))].sort(), (v) => v);
+    fill($('#missing-reason'), [...new Set(songs.flatMap((s) => s.reasons))].sort((a, b) => reasonLabel(a).localeCompare(reasonLabel(b))), reasonLabel);
+    const byReason = {};
+    for (const s of songs) for (const r of s.reasons) byReason[r] = (byReason[r] || 0) + 1;
+    $('#missing-stats').replaceChildren(
+      h('div', { class: 'stat' }, h('b', {}, songs.length), songs.length === 1 ? 'song missing' : 'songs missing'),
+      ...Object.entries(byReason)
+        .sort((a, b) => b[1] - a[1])
+        .map(([r, n]) => h('div', { class: 'stat' }, h('b', {}, n), reasonLabel(r))),
+    );
+    renderMissing();
+  } catch (err) {
+    flash(err.message);
+    $('#missing-rows').replaceChildren();
+  }
+}
+
+function renderMissing() {
+  const songs = state.missing || [];
+  const q = $('#missing-search').value.trim().toLowerCase();
+  const source = $('#missing-source').value;
+  const reason = $('#missing-reason').value;
+  const shown = songs.filter((s) => {
+    const places = s.places.filter((p) => (!source || p.formatLabel === source) && (!reason || p.reason === reason));
+    if (!places.length) return false;
+    if (!q) return true;
+    return [s.title, s.artist, s.album, ...places.map((p) => p.collection)].some((v) => v && v.toLowerCase().includes(q));
+  });
+  const LIMIT = 500;
+  const rows = shown.slice(0, LIMIT).map((s) => {
+    const places = s.places.filter((p) => (!source || p.formatLabel === source) && (!reason || p.reason === reason));
+    const link = places.find((p) => p.url)?.url;
+    const title = s.title || 'Untitled track';
+    return h(
+      'tr',
+      {},
+      h(
+        'td',
+        {},
+        h('div', { class: 'src-title' }, link ? h('a', { href: link, target: '_blank', rel: 'noopener' }, title) : title),
+        h('div', { class: 'sub' }, [s.artist, s.album].filter(Boolean).join(' · ')),
+      ),
+      h(
+        'td',
+        {},
+        ...places.map((p) =>
+          h('div', { class: 'place' }, p.collection, h('span', { class: 'sub' }, ` · ${p.formatLabel}, ${new Date(p.createdAt).toLocaleDateString()}`)),
+        ),
+      ),
+      h(
+        'td',
+        {},
+        ...[...new Set(places.map((p) => p.reason))].map((r) => {
+          const detail = places.find((p) => p.reason === r && p.detail)?.detail;
+          return h('div', {}, h('span', { class: `status ${r === 'own_audio_file' || r === 'excluded_by_you' ? 'review' : 'not_found'}`, title: detail || '' }, reasonLabel(r)), detail ? h('div', { class: 'sub' }, detail) : null);
+        }),
+      ),
+    );
+  });
+  $('#missing-rows').replaceChildren(
+    ...(rows.length
+      ? rows
+      : [h('tr', {}, h('td', { colspan: '3', class: 'muted' }, songs.length ? 'No songs match these filters.' : 'Nothing is missing — every imported song is on TIDAL.'))]),
+  );
+  $('#missing-count').textContent =
+    shown.length > LIMIT ? `Showing the first ${LIMIT} of ${shown.length} songs — narrow the search or download the CSV` : `${shown.length} of ${songs.length} songs`;
+}
+
 // ---- wiring ---------------------------------------------------------------------
 
 function wire() {
@@ -480,6 +576,12 @@ function wire() {
   $('#btn-retry').addEventListener('click', retry);
   document.querySelectorAll('.filters .chip[data-filter]').forEach((b) => b.addEventListener('click', () => setFilter(b.dataset.filter)));
   $('#btn-accept-review').addEventListener('click', acceptAllReview);
+  $('#btn-missing').addEventListener('click', openMissing);
+  $('#btn-done-missing').addEventListener('click', openMissing);
+  $('#btn-missing-back').addEventListener('click', home);
+  $('#missing-search').addEventListener('input', renderMissing);
+  $('#missing-source').addEventListener('change', renderMissing);
+  $('#missing-reason').addEventListener('change', renderMissing);
 }
 
 async function init() {

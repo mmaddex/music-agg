@@ -146,6 +146,13 @@ The done screen shows the count and a **Download the list (CSV)** link
 (`GET /api/imports/{id}/not-imported.csv`). The record is deleted with the import after
 `IMPORT_RETENTION_DAYS` (default 30), so download the CSV to keep it.
 
+**Songs missing from TIDAL** (linked from Recent imports and the done screen) puts these
+records from every import into one table you can search and filter by source and reason
+(`GET /api/missing`, or `GET /api/missing.csv` for all of it as one CSV). A song missing from
+several playlists or exports is one row listing each place; songs match on title + artist,
+ignoring case, accents and punctuation. A song that another import did add to TIDAL (same
+source track) is left out.
+
 ### About the YouTube Music export
 
 Takeout's playlist CSVs contain only **YouTube video ids**, with no song or artist. Titles

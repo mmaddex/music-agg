@@ -2,6 +2,7 @@
 
 import crypto from 'node:crypto';
 import { tx } from '../db/pool.js';
+import { normalize } from '../util/text.js';
 
 export const ACTIVE_STATUSES = ['matching', 'loading'];
 
@@ -332,4 +333,70 @@ export async function deleteOldImports(pool, days = 30) {
     [days],
   );
   return rowCount;
+}
+
+// ---- missing songs across imports ---------------------------------------------------------
+
+/**
+ * Every song in any of the account's imports that did not reach TIDAL, merged into one list.
+ * The same song (same title + artist, or the same source id) missing from several playlists or
+ * several exports is one row that lists each place it is missing from. A song that a later (or
+ * any other) import did add to TIDAL is left out: it is no longer missing.
+ * @returns [{ title, artist, album, reasons, places: [{ importId, filename, formatLabel,
+ *            createdAt, collection, reason, detail, url, audioFile }] }], sorted by artist, title
+ */
+export async function missingAcrossImports(db, accountId) {
+  const { rows: imports } = await db.query(
+    `SELECT id, filename, format_label, created_at, library->'notImportable' AS not_importable
+       FROM imports WHERE account_id = $1 AND stage = 'load' ORDER BY created_at DESC`,
+    [accountId],
+  );
+  if (!imports.length) return [];
+  const { rows: targets } = await db.query(
+    'SELECT import_id, name, status, items, unimported FROM import_targets WHERE import_id = ANY($1::uuid[]) ORDER BY position',
+    [imports.map((i) => i.id)],
+  );
+  const byImport = new Map(imports.map((i) => [i.id, []]));
+  for (const t of targets) byImport.get(t.import_id).push(t);
+
+  // Source keys that some finished collection wrote to TIDAL.
+  const written = new Set();
+  for (const t of targets) {
+    if (t.status !== 'done') continue;
+    const failed = new Set(t.unimported.map((u) => u.key));
+    for (const i of t.items) if (i.key && !failed.has(i.key)) written.add(i.key);
+  }
+
+  const songs = new Map();
+  const add = (imp, collection, u) => {
+    if (u.key && written.has(u.key)) return;
+    const id = u.title ? `${normalize(u.title)}|${normalize(u.artist)}` : `key:${u.key || u.url || u.audioFile}`;
+    let song = songs.get(id);
+    if (!song) {
+      song = { title: u.title || null, artist: u.artist || null, album: u.album || null, reasons: [], places: [] };
+      songs.set(id, song);
+    }
+    song.album ||= u.album || null;
+    if (!song.reasons.includes(u.reason)) song.reasons.push(u.reason);
+    song.places.push({
+      importId: imp.id,
+      filename: imp.filename,
+      formatLabel: imp.format_label,
+      createdAt: imp.created_at,
+      collection,
+      reason: u.reason,
+      detail: u.detail || null,
+      url: u.url || null,
+      audioFile: u.audioFile || null,
+    });
+  };
+  for (const imp of imports) {
+    const its = byImport.get(imp.id);
+    for (const t of its) for (const u of t.unimported) add(imp, t.name, u);
+    for (const u of notImportableRecord({ library: { notImportable: imp.not_importable || [] } }, its)) add(imp, AUDIO_FILES_COLLECTION, u);
+  }
+  const out = [...songs.values()];
+  const cmp = (a, b) => String(a || '￿').localeCompare(String(b || '￿'), undefined, { sensitivity: 'base' });
+  out.sort((a, b) => cmp(a.artist, b.artist) || cmp(a.title, b.title));
+  return out;
 }
