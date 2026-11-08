@@ -6,7 +6,8 @@
 // { filename, buffer }. Zips on disk are read with random access, so only the entries we keep
 // are ever decompressed: a Google Play Music export full of MP3s costs memory only for its CSVs.
 //
-// ExportBundle { name, files: [{ path, size, text: string }], skipped: [{ path, reason, size? }] }
+// ExportBundle { name, files: [{ path, size, text: string }], skipped: [{ path, reason, size? }],
+//                media: [{ path, size }] }   audio files found (listed, never decompressed)
 //
 // Zips inside zips are opened too (Apple's privacy export nests three deep); their files get
 // the nested archive's path as a prefix, e.g. "outer/inner.zip/data/file.json". Files too
@@ -31,6 +32,26 @@ const ARCHIVE_EXTENSIONS = new Set(['.zip']);
 
 // Only file types an adapter could plausibly read are decompressed.
 const TEXT_EXTENSIONS = new Set(['.csv', '.tsv', '.txt', '.json', '.xml', '.m3u', '.m3u8']);
+// Audio files (e.g. songs a user uploaded to Google Play Music) are listed by name and size so
+// they can be reported as not importable; TIDAL can't store users' own audio.
+export const AUDIO_EXTENSIONS = new Set(['.mp3', '.m4a', '.aac', '.flac', '.ogg', '.oga', '.opus', '.wav', '.wma', '.aif', '.aiff', '.alac']);
+
+// Zip entry names without the UTF-8 flag are officially CP437, but macOS and Takeout write
+// UTF-8 bytes anyway. Use UTF-8 when the bytes are valid UTF-8, else CP437 (bytes 0x80–0xFF).
+const CP437_HIGH =
+  'ÇüéâäàåçêëèïîìÄÅÉæÆôöòûùÿÖÜ¢£¥₧ƒáíóúñÑªº¿⌐¬½¼¡«»░▒▓│┤╡╢╖╕╣║╗╝╜╛┐└┴┬├─┼╞╟╚╔╩╦╠═╬╧╨╤╥╙╘╒╓╫╪┘┌█▄▌▐▀αßΓπΣσµτΦΘΩδ∞φε∩≡±≥≤⌠⌡÷≈°∙·√ⁿ²■\u00a0';
+const strictUtf8 = new TextDecoder('utf-8', { fatal: true });
+
+export function decodeEntryName(raw, utf8Flag = false) {
+  if (typeof raw === 'string') return raw.normalize('NFC');
+  let name;
+  try {
+    name = strictUtf8.decode(raw);
+  } catch {
+    name = utf8Flag ? raw.toString('utf8') : Array.from(raw, (b) => (b < 0x80 ? String.fromCharCode(b) : CP437_HIGH[b - 0x80])).join('');
+  }
+  return name.normalize('NFC');
+}
 
 export class BundleError extends Error {}
 /** An upload-wide limit was hit: fatal even when it happens inside a nested archive. */
@@ -87,7 +108,7 @@ async function uploadHead(upload) {
   }
 }
 
-const newContext = () => ({ entries: 0, fileCount: 0, total: 0, archiveBytes: 0, skipped: [] });
+const newContext = () => ({ entries: 0, fileCount: 0, total: 0, archiveBytes: 0, skipped: [], media: [] });
 
 function addBytes(ctx, n) {
   ctx.total += n;
@@ -120,10 +141,12 @@ export async function loadBundles(uploads) {
     }
     files.push(...(await loader.load(upload, ctx)));
   }
-  return { name: uploads.map((u) => u.filename).join(', '), files, skipped: ctx.skipped };
+  return { name: uploads.map((u) => u.filename).join(', '), files, skipped: ctx.skipped, media: ctx.media };
 }
 
-const ZIP_OPTIONS = { lazyEntries: true, validateEntrySizes: true, strictFileNames: false };
+// decodeStrings: false → names arrive as bytes and decodeEntryName picks UTF-8 or CP437. (Names
+// are only used as labels; nothing is ever written to disk under them.)
+const ZIP_OPTIONS = { lazyEntries: true, validateEntrySizes: true, decodeStrings: false };
 
 /** Open a zip from a Buffer, or from { path } on disk (random access, nothing read up front). */
 function openZip(source, cb) {
@@ -157,10 +180,14 @@ function loadZip(source, ctx, prefix = '', depth = 0) {
       zip.on('entry', (entry) => {
         ctx.entries += 1;
         if (ctx.entries > LIMITS.maxEntries) return fail(new LimitError('Archive has too many entries.'));
-        const name = entry.fileName.replace(/\\/g, '/');
+        const name = decodeEntryName(entry.fileName, (entry.generalPurposeBitFlag & 0x800) !== 0).replace(/\\/g, '/');
         const fullPath = prefix + name;
         if (name.endsWith('/') || isJunkPath(name)) return next();
         const ext = path.extname(name).toLowerCase();
+        if (AUDIO_EXTENSIONS.has(ext)) {
+          if (entry.uncompressedSize > 0) ctx.media.push({ path: fullPath, size: entry.uncompressedSize });
+          return next();
+        }
         const isArchive = ARCHIVE_EXTENSIONS.has(ext);
         if (!isArchive && !TEXT_EXTENSIONS.has(ext)) return next();
         if (isArchive && depth >= LIMITS.maxDepth) {

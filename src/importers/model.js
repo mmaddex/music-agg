@@ -6,6 +6,8 @@
 //   format:      adapter id, e.g. "youtube-music"
 //   formatLabel: human name, e.g. "YouTube Music (Google Takeout)"
 //   collections: Collection[]
+//   notImportable: NotImportable[]  things in the export TIDAL can't take at all (e.g. the user's
+//                own audio files, see audioFiles.js); listed in the "not imported" record
 //   warnings:    string[]
 // }
 //

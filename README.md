@@ -134,6 +134,13 @@ artist, album, source link and a reason:
 | `match_error` | matching kept failing for this track |
 | `unavailable_on_tidal` | TIDAL refused it at write time (`NOT_FOUND`: not available for your account/country) |
 | `write_failed` | the collection stopped after repeated errors; cleared when you press Retry |
+| `own_audio_file` | an audio file in the export (e.g. an MP3 you uploaded to Google Play Music). TIDAL only adds songs from its catalogue and can't store your own audio |
+
+Audio files are listed under the collection **Your audio files**, one row per file (duplicate
+copies listed once). The `audio_file` column holds the file's path inside the export, on those
+rows and on any other row whose song has an audio file, so you can tell when an MP3 of a
+missing song exists. When the file's song is also in the export's song lists, the row's detail
+says whether that song was added from TIDAL's catalogue anyway.
 
 The done screen shows the count and a **Download the list (CSV)** link
 (`GET /api/imports/{id}/not-imported.csv`). The record is deleted with the import after
@@ -165,7 +172,9 @@ the export (App Store, TV, play history) is ignored.
 
 Google Play Music closed in 2020, but its Takeout zips still work. They hold one CSV per song
 under `Google Play Music/Tracks/`, a folder per playlist under `Playlists/`, and any MP3s you
-uploaded. The MP3s and radio stations are ignored, and the audio is never decompressed.
+uploaded. Radio stations are ignored. The MP3s are never decompressed: TIDAL can't take your
+own audio, so each one is listed in the import's "not imported" record (reason
+`own_audio_file`) with its path in the export. This works for audio files in any export.
 
 * **Library songs** become TIDAL favourites, and complete albums among them are saved whole.
   Removed songs and thumbs-down songs are left out.

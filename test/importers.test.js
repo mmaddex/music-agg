@@ -6,6 +6,9 @@ import { loadBundle, loadBundles, BundleError, LIMITS, decodeText, fileHead } fr
 import { parseBundle, parseExport, UnknownFormatError } from '../src/importers/registry.js';
 import { summarizeLibrary } from '../src/importers/model.js';
 import { decodeHtmlEntities } from '../src/util/text.js';
+import { describeAudioFile } from '../src/importers/audioFiles.js';
+import { decodeEntryName } from '../src/importers/bundle.js';
+import { notImportableRecord, audioFilesByKey } from '../src/imports/repo.js';
 
 const fixture = new URL('./fixtures/youtube-takeout.zip', import.meta.url);
 
@@ -262,6 +265,7 @@ test('Google Play Music Takeout: library → favourites, playlists in Playlist I
     'Skipped 2 playlist entries marked as removed.',
     'Skipped deleted playlists: "Old Stuff".',
     'Skipped empty playlists: "Spring".',
+    '2 audio files in this export can\'t be imported: TIDAL only adds songs from its own catalogue and can\'t store your own audio. They\'re listed in the import\'s "not imported" record.',
   ]);
 });
 
@@ -279,4 +283,65 @@ test('Google Play Music Takeout uploaded twice is not duplicated', async () => {
 test('decodeHtmlEntities handles numeric, hex and named references', () => {
   assert.equal(decodeHtmlEntities('I&#39;m &amp; you&#x2019;re &quot;ok&quot; &bogus;'), 'I\'m & you’re "ok" &bogus;');
   assert.equal(decodeHtmlEntities(null), null);
+});
+
+// ---- the export's own audio files ------------------------------------------------------
+
+test('audio files are listed (not decompressed), de-duplicated and linked to their songs', async () => {
+  const lib = await parseExport({ filename: 'takeout.zip', path: fileURLToPath(gpmFixture) });
+  const songs = lib.collections[0];
+  const soWhat = songs.tracks.find((t) => t.title === 'So What');
+  assert.deepEqual(lib.notImportable, [
+    {
+      path: 'Takeout/Google Play Music/Tracks/Garage Band - Demos(003)Basement Ja.mp3',
+      title: 'Basement Ja',
+      artist: 'Garage Band',
+      album: 'Demos',
+      reason: 'own_audio_file',
+      linkedKey: null,
+    },
+    {
+      path: 'Takeout/Google Play Music/Tracks/Miles Davis - Kind of Blue - So What.mp3',
+      title: 'So What',
+      artist: 'Miles Davis',
+      album: 'Kind of Blue',
+      reason: 'own_audio_file',
+      linkedKey: soWhat.key,
+    },
+  ], 'the "(1)" copy is listed once');
+  assert.ok(!lib.collections.some((c) => c.tracks.some((t) => /mp3/i.test(t.title))), 'audio files never become tracks');
+});
+
+test('audio file names: Google Play Music patterns, truncated titles, duplicate copies', () => {
+  assert.deepEqual(describeAudioFile('x/Trio Mossoró -  - Hoje não, saudade (1).mp3'), { artist: 'Trio Mossoró', album: null, title: 'Hoje não, saudade', truncated: false });
+  assert.deepEqual(describeAudioFile('Jim Campilongo - Dream Dictionary(002)The Past .mp3'), { artist: 'Jim Campilongo', album: 'Dream Dictionary', title: 'The Past', truncated: true });
+  assert.deepEqual(describeAudioFile('Artist - Song.m4a'), { artist: 'Artist', album: null, title: 'Song', truncated: false });
+  assert.deepEqual(describeAudioFile('track01.flac'), { artist: null, album: null, title: 'track01', truncated: false });
+});
+
+test('the not-imported record marks audio files and says whether the song reached TIDAL', async () => {
+  const lib = await parseExport({ filename: 'takeout.zip', path: fileURLToPath(gpmFixture) });
+  const imp = { library: { collections: lib.collections, notImportable: lib.notImportable } };
+  const soWhatKey = lib.notImportable[1].linkedKey;
+  const target = (items, unimported = []) => ({ items: items.map((key) => ({ key })), unimported: unimported.map((key) => ({ key })) });
+
+  const before = notImportableRecord(imp, []);
+  assert.deepEqual(before.map((r) => [r.reason, r.audioFile.split('/').pop()]), [
+    ['own_audio_file', 'Garage Band - Demos(003)Basement Ja.mp3'],
+    ['own_audio_file', 'Miles Davis - Kind of Blue - So What.mp3'],
+  ]);
+  assert.match(before[0].detail, /isn't in the export's song lists/);
+  assert.match(before[1].detail, /matched separately/);
+
+  assert.match(notImportableRecord(imp, [target([soWhatKey])])[1].detail, /added from TIDAL's catalogue instead/);
+  assert.match(notImportableRecord(imp, [target([], [soWhatKey])])[1].detail, /wasn't found on TIDAL either/);
+  assert.match(notImportableRecord(imp, [target(['other'])])[1].detail, /wasn't part of this import/);
+
+  assert.equal(audioFilesByKey(imp).get(soWhatKey), lib.notImportable[1].path, 'other rows for this song can point at its audio file');
+});
+
+test('zip entry names: UTF-8 bytes without the UTF-8 flag are decoded as UTF-8, else CP437', () => {
+  assert.equal(decodeEntryName(Buffer.from('Trio Mossoró.mp3'.normalize('NFD'), 'utf8')), 'Trio Mossoró.mp3', 'and NFC-normalised');
+  assert.equal(decodeEntryName(Buffer.from([0x43, 0x61, 0x66, 0x82])), 'Café', 'CP437 0x82 → é');
+  assert.equal(decodeEntryName('already a string'), 'already a string');
 });

@@ -18,6 +18,9 @@ const library = await parseExport({ files });
 console.log(`Format: ${library.formatLabel} (${library.format})`);
 for (const w of library.warnings) console.log(`Warning: ${w}`);
 for (const s of library.skippedFiles) console.log(`Skipped file: ${s.path} (${s.reason}${s.size ? `, ${Math.round(s.size / 1024 / 1024)} MB` : ''})`);
+for (const f of library.notImportable) {
+  console.log(`Not importable (${f.reason}): ${f.artist ?? '?'} — ${f.title ?? '?'}${f.linkedKey ? `  [also in song lists: ${f.linkedKey}]` : ''}`);
+}
 for (const c of library.collections) {
   const lookups = c.tracks.filter((t) => t.needsLookup).length;
   console.log(`${c.suggested ? '[x]' : '[ ]'} ${c.kind.padEnd(9)} ${c.name.padEnd(32)} ${String(c.tracks.length).padStart(5)} tracks  ${lookups} need lookup`);

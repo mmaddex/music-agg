@@ -157,7 +157,7 @@ test('full flow: login → upload → match workflow → review → load workflo
   assert.match(csv.headers.get('content-type'), /^text\/csv/);
   assert.match(csv.headers.get('content-disposition'), /filename="export-not-imported\.csv"/);
   const bytes = Buffer.from(await csv.arrayBuffer());
-  assert.equal(bytes.toString('utf8'), '\ufeffcollection,title,artist,album,reason,detail,source_url\r\n', 'UTF-8 BOM so Excel opens it correctly');
+  assert.equal(bytes.toString('utf8'), '\ufeffcollection,title,artist,album,reason,detail,source_url,audio_file\r\n', 'UTF-8 BOM so Excel opens it correctly');
 
   // A multi-part export (Apple's "Part 1 of 2" + "Part 2 of 2") is uploaded in one request.
   const multi = new FormData();

@@ -116,7 +116,8 @@ async function importView(pool, imp, { withResults = false } = {}) {
       };
     });
     view.progress = { phase: 'Importing to TIDAL', done, total };
-    view.notImported = targets.reduce((n, t) => n + t.unimported.length, 0);
+    view.audioFilesNotImported = imp.library?.notImportable?.length || 0;
+    view.notImported = targets.reduce((n, t) => n + t.unimported.length, 0) + view.audioFilesNotImported;
   }
   if (withResults && imp.stage) view.results = await repo.matchResults(pool, imp);
   return view;
@@ -344,10 +345,19 @@ export function createApp({ pool, dispatcher, fetchImpl = fetch }) {
   app.get('/api/imports/:importId/not-imported.csv', requireLogin, wrap(async (req, res) => {
     const imp = await loadImport(req);
     const targets = await repo.getTargets(pool, imp.id);
-    const header = ['collection', 'title', 'artist', 'album', 'reason', 'detail', 'source_url'];
+    // audio_file: the path, inside the export, of the user's own audio file for this song. Set on
+    // the "Your audio files" rows and on any other row whose song has an audio file in the export.
+    const header = ['collection', 'title', 'artist', 'album', 'reason', 'detail', 'source_url', 'audio_file'];
     const lines = [header.join(',')];
+    const audioByKey = repo.audioFilesByKey(imp);
     for (const t of targets) {
-      for (const u of t.unimported) lines.push([t.name, u.title, u.artist, u.album, u.reason, u.detail, u.url].map(csvCell).join(','));
+      for (const u of t.unimported) {
+        lines.push([t.name, u.title, u.artist, u.album, u.reason, u.detail, u.url, audioByKey.get(u.key)].map(csvCell).join(','));
+      }
+    }
+    // The export's own audio files: TIDAL can't take them in any collection.
+    for (const u of repo.notImportableRecord(imp, targets)) {
+      lines.push([repo.AUDIO_FILES_COLLECTION, u.title, u.artist, u.album, u.reason, u.detail, u.url, u.audioFile].map(csvCell).join(','));
     }
     const base = imp.filename.replace(/\.[^.]+$/, '').replace(/[^\w.-]+/g, '_') || 'import';
     res.set('content-type', 'text/csv; charset=utf-8');

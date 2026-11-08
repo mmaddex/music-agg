@@ -426,9 +426,21 @@ function showDone(view) {
       ),
     );
   const missing = view.notImported || 0;
+  const audio = view.audioFilesNotImported || 0;
+  const tracks = missing - audio;
+  const parts = [
+    tracks ? `${tracks} track${tracks === 1 ? '' : 's'} couldn't be imported.` : '',
+    audio ? `${audio} of your own audio file${audio === 1 ? '' : 's'} (e.g. uploaded MP3s) can't be added: TIDAL only adds songs from its catalogue.` : '',
+  ].filter(Boolean);
   $('#done-not-imported').replaceChildren(
     missing
-      ? h('p', {}, `${missing} track${missing === 1 ? '' : 's'} couldn't be imported. `, h('a', { href: `/api/imports/${view.id}/not-imported.csv` }, 'Download the list (CSV)'), ' — title, artist, album and the reason for each.')
+      ? h(
+          'p',
+          {},
+          `${parts.join(' ')} `,
+          h('a', { href: `/api/imports/${view.id}/not-imported.csv` }, 'Download the list (CSV)'),
+          ' — title, artist, album and the reason for each. Audio files are listed under “Your audio files”, with the file’s path in the audio_file column.',
+        )
       : h('p', { class: 'muted' }, 'Every selected track was imported.'),
   );
   show('done');

@@ -10,7 +10,7 @@ export async function createImport(pool, { accountId, filename, library }) {
   await pool.query(
     `INSERT INTO imports (id, account_id, filename, format, format_label, library, warnings, status)
      VALUES ($1, $2, $3, $4, $5, $6, $7, 'parsed')`,
-    [id, accountId, filename, library.format, library.formatLabel, JSON.stringify({ collections: library.collections }), JSON.stringify(library.warnings || [])],
+    [id, accountId, filename, library.format, library.formatLabel, JSON.stringify({ collections: library.collections, notImportable: library.notImportable || [] }), JSON.stringify(library.warnings || [])],
   );
   return id;
 }
@@ -193,6 +193,45 @@ export function notImported(t, key, { reason, detail }) {
     reason,
     detail: detail || null,
   };
+}
+
+export const AUDIO_FILES_COLLECTION = 'Your audio files';
+
+/**
+ * Rows of the "not imported" record for things TIDAL can't take at all (the export's own audio
+ * files), shaped like notImported(). `targets` (from getTargets) say whether the same song,
+ * when it is also in the export's song lists, reached TIDAL from the catalogue.
+ */
+export function notImportableRecord(imp, targets = []) {
+  const items = imp.library?.notImportable || [];
+  if (!items.length) return [];
+  const failed = new Set(targets.flatMap((t) => t.unimported.map((u) => u.key)));
+  const written = new Set(targets.flatMap((t) => t.items.map((i) => i.key)).filter((k) => !failed.has(k)));
+  const loaded = targets.length > 0;
+  return items.map((f) => {
+    let detail = "TIDAL can't store your own audio files";
+    if (!f.linkedKey) detail += ", and this song isn't in the export's song lists, so it wasn't matched";
+    else if (written.has(f.linkedKey)) detail += ". This song was added from TIDAL's catalogue instead";
+    else if (failed.has(f.linkedKey)) detail += ", and this song wasn't found on TIDAL either";
+    else detail += loaded ? ". The same song is in your song lists but wasn't part of this import" : '. The same song is in your song lists and is matched separately';
+    return {
+      key: f.linkedKey || null,
+      title: f.title,
+      artist: f.artist,
+      album: f.album,
+      url: null,
+      reason: f.reason || 'own_audio_file',
+      detail: `${detail}.`,
+      audioFile: f.path,
+    };
+  });
+}
+
+/** Track key → path of the export's audio file for that song (see notImportable). */
+export function audioFilesByKey(imp) {
+  const map = new Map();
+  for (const f of imp.library?.notImportable || []) if (f.linkedKey && !map.has(f.linkedKey)) map.set(f.linkedKey, f.path);
+  return map;
 }
 
 /** Source details for tracks (by key), to describe tracks that fail at write time. */
