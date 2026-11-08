@@ -6,10 +6,11 @@
 
 import { loadBundles } from './bundle.js';
 import { appleMusic } from './adapters/appleMusic.js';
+import { googlePlayMusic } from './adapters/googlePlayMusic.js';
 import { youtubeMusic } from './adapters/youtubeMusic.js';
 import { genericCsv } from './adapters/genericCsv.js';
 
-export const ADAPTERS = [youtubeMusic, appleMusic, genericCsv];
+export const ADAPTERS = [youtubeMusic, appleMusic, googlePlayMusic, genericCsv];
 
 export class UnknownFormatError extends Error {}
 
@@ -43,8 +44,8 @@ export function parseBundle(bundle, { formatId } = {}) {
 }
 
 /**
- * Upload → Library in one step. Pass `files: [{ filename, buffer }]` for a multi-file export
- * (e.g. Apple's "Part 1 of 2" / "Part 2 of 2"), or a single `filename` + `buffer`.
+ * Upload → Library in one step. Pass `files: [{ filename, path | buffer }]` for one or more
+ * uploads (e.g. Apple's "Part 1 of 2" / "Part 2 of 2"), or a single `filename` + `buffer`.
  */
 export async function parseExport({ files, filename, buffer, formatId }) {
   const bundle = await loadBundles(files ?? [{ filename, buffer }]);

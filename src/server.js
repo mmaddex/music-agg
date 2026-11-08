@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { rm } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import express from 'express';
@@ -162,8 +163,18 @@ export function createApp({ pool, dispatcher, fetchImpl = fetch }) {
   app.use(express.json({ limit: '5mb' }));
 
   // Several files per upload: multi-part exports such as Apple's "… Part 1 of 2.zip" + "Part 2 of 2.zip".
+  // Uploads are streamed to temp files, not RAM: exports can be hundreds of MB of audio (Google
+  // Play Music ships uploaded MP3s), and the zip reader only decompresses the entries it keeps.
   const MAX_UPLOAD_FILES = 10;
-  const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: config.maxUploadBytes, files: MAX_UPLOAD_FILES } });
+  const upload = multer({ dest: config.uploadDir, limits: { fileSize: config.maxUploadBytes, files: MAX_UPLOAD_FILES } });
+  // Temp files go away when the response is done, however the request ended. (On a multer error
+  // mid-upload, multer removes what it wrote itself.)
+  const removeUploadsAfterResponse = (req, res, next) => {
+    res.on('close', () => {
+      for (const f of req.files || []) rm(f.path, { force: true }).catch((err) => log.warn('upload.cleanup_failed', { err }));
+    });
+    next();
+  };
 
   const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
   // The session store is async: persist before redirecting, or the browser can arrive at the
@@ -284,7 +295,7 @@ export function createApp({ pool, dispatcher, fetchImpl = fetch }) {
     });
   }));
 
-  app.post('/api/uploads', requireLogin, upload.array('file', MAX_UPLOAD_FILES), wrap(async (req, res) => {
+  app.post('/api/uploads', requireLogin, upload.array('file', MAX_UPLOAD_FILES), removeUploadsAfterResponse, wrap(async (req, res) => {
     const uploads = req.files || [];
     if (!uploads.length) return res.status(400).json({ error: 'No file uploaded.' });
     let library;
@@ -299,7 +310,7 @@ export function createApp({ pool, dispatcher, fetchImpl = fetch }) {
     };
     try {
       library = await parseExport({
-        files: uploads.map((f) => ({ filename: f.originalname, buffer: f.buffer })),
+        files: uploads.map((f) => ({ filename: f.originalname, path: f.path })),
         formatId: req.body?.format || undefined,
       });
     } catch (err) {

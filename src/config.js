@@ -1,5 +1,8 @@
 // Runtime configuration from environment variables. See .env.example.
 
+import os from 'node:os';
+import path from 'node:path';
+
 const env = process.env;
 const port = Number(env.PORT) || 3000;
 
@@ -22,7 +25,9 @@ export const config = {
   tidalMinIntervalMs: Number(env.TIDAL_MIN_INTERVAL_MS ?? 200),
   sessionSecret: env.SESSION_SECRET || '',
   tokenEncryptionKey: env.TOKEN_ENCRYPTION_KEY || '',
-  maxUploadBytes: (Number(env.MAX_UPLOAD_MB) || 100) * 1024 * 1024,
+  // Per file. Uploads are written to temp files (not RAM), so this is bounded by disk, not memory.
+  maxUploadBytes: (Number(env.MAX_UPLOAD_MB) || 1024) * 1024 * 1024,
+  uploadDir: env.UPLOAD_DIR || path.join(os.tmpdir(), 'music-agg-uploads'),
   workflows: {
     // "render" in production; "inline" runs tasks in the web process (local dev only).
     mode: env.WORKFLOW_MODE || (workflowConfigured ? 'render' : 'inline'),

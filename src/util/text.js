@@ -112,3 +112,17 @@ export function toIsoDate(value) {
   const date = new Date(cleaned);
   return Number.isNaN(date.getTime()) ? null : date.toISOString().replace(/\.000Z$/, 'Z');
 }
+
+const NAMED_ENTITIES = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ' };
+
+/** Decode HTML character references ("I&#39;m", "&amp;", "&#x2019;"). Unknown names are kept. */
+export function decodeHtmlEntities(value) {
+  if (value == null) return value;
+  return String(value).replace(/&(#\d+|#x[0-9a-f]+|[a-z]+);/gi, (whole, ref) => {
+    if (ref[0] === '#') {
+      const code = ref[1] === 'x' || ref[1] === 'X' ? parseInt(ref.slice(2), 16) : parseInt(ref.slice(1), 10);
+      return Number.isInteger(code) && code > 0 && code <= 0x10ffff ? String.fromCodePoint(code) : whole;
+    }
+    return NAMED_ENTITIES[ref.toLowerCase()] ?? whole;
+  });
+}

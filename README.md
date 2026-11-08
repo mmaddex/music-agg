@@ -4,9 +4,11 @@ A web app that imports music-service exports into **TIDAL**. You log in with you
 account and upload an export. Then you review the matches, and the app creates the playlists
 and adds favourites in your TIDAL account.
 
-Today it supports **YouTube Music (Google Takeout)**, **Apple Music (Apple's privacy export)**
-and **plain CSV files with title/artist columns**. Multi-part exports are uploaded together in
-one go (up to 10 files). The importer is built so other services can be added as small plug-in
+Today it supports **YouTube Music (Google Takeout)**, **Google Play Music (Google Takeout)**,
+**Apple Music (Apple's privacy export)** and **plain CSV files with title/artist columns**.
+Multi-part exports are uploaded together in one go (up to 10 files, 1 GB each). Uploads are
+streamed to temporary files and deleted after parsing, so large exports full of audio don't
+use memory; only the files an adapter can read are decompressed. The importer is built so other services can be added as small plug-in
 adapters (see [Adding an export format](#adding-an-export-format)).
 
 The slow, network-heavy work runs as **[Render Workflows](https://render.com/docs/workflows)**:
@@ -159,6 +161,19 @@ the export (App Store, TV, play history) is ignored.
   Subscribed playlists are skipped because the export doesn't list their songs.
 * The export has no ISRCs, so every song is matched by title, artist, album and duration.
 
+### About the Google Play Music export
+
+Google Play Music closed in 2020, but its Takeout zips still work. They hold one CSV per song
+under `Google Play Music/Tracks/`, a folder per playlist under `Playlists/`, and any MP3s you
+uploaded. The MP3s and radio stations are ignored, and the audio is never decompressed.
+
+* **Library songs** become TIDAL favourites, and complete albums among them are saved whole.
+  Removed songs and thumbs-down songs are left out.
+* **Playlists**, including the automatic *Thumbs Up* list, become TIDAL playlists in their
+  original order. Entries marked removed and deleted playlists are skipped.
+* Text in the export is HTML-escaped (`I&#39;m`) and is decoded. There are no ids or ISRCs,
+  so songs are matched by title, artist, album and duration.
+
 ## Running locally
 
 Requires Node 20+ and a Postgres database.
@@ -227,7 +242,8 @@ tasks can't read the user's TIDAL tokens.
 | `MATCH_CHUNK_SIZE` / `MATCH_PARALLELISM` | workflow | no | Default 100 / 2 |
 | `LOG_LEVEL` | both | no | `debug`, `info` (default), `warn`, `error`, `silent`. See [Logs](#logs) |
 | `DATABASE_SSL` | both | no | Override TLS auto-detection |
-| `MAX_UPLOAD_MB` / `IMPORT_RETENTION_DAYS` | web | no | Default 100 (per file) / 30 |
+| `MAX_UPLOAD_MB` / `IMPORT_RETENTION_DAYS` | web | no | Default 1024 (per file) / 30 |
+| `UPLOAD_DIR` | web | no | Where uploads are written while they're parsed. Default: the OS temp dir |
 
 `TIDAL_CLIENT_SECRET` is **not** used: TIDAL's user-login (PKCE) flow needs only the client id.
 
@@ -278,7 +294,7 @@ Tokens, OAuth codes, cookies and Authorization headers are never logged.
    * `text` is decoded each time it is read, so read it once per pass. In `detect`, use
      `fileHead(file)` from `bundle.js` to sniff headers without decoding a large file.
    * Files over 100 MB are skipped rather than failing the upload; they're listed in
-     `bundle.skipped`.
+     `bundle.skipped`. Files of other types (audio, HTML) are never decompressed.
    * `detect` returns a confidence from 0 to 1. The highest score wins, and the generic CSV
      adapter scores 0.5.
    * `parse` returns `{ collections, warnings }` built with `makeCollection` / `makeTrack` from

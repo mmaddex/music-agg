@@ -33,8 +33,8 @@ projects:
             name: music-agg
             runtime: node
             region: oregon
-            # 2 GB: uploads (up to 10 files × MAX_UPLOAD_MB) are held and parsed in memory; a real
-            # Apple Media Services export peaks around 440 MB, over the 512 MB starter plan.
+            # 2 GB: uploads go to temp files on disk, but the text an adapter reads is parsed in
+            # memory; a real Apple Media Services export peaks around 440 MB, over starter's 512 MB.
             plan: standard
             buildCommand: npm ci --omit=dev
             startCommand: npm start

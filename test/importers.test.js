@@ -1,9 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
 import { loadBundle, loadBundles, BundleError, LIMITS, decodeText, fileHead } from '../src/importers/bundle.js';
 import { parseBundle, parseExport, UnknownFormatError } from '../src/importers/registry.js';
 import { summarizeLibrary } from '../src/importers/model.js';
+import { decodeHtmlEntities } from '../src/util/text.js';
 
 const fixture = new URL('./fixtures/youtube-takeout.zip', import.meta.url);
 
@@ -202,4 +204,79 @@ test('Apple Music adapter reports unreadable JSON instead of failing', () => {
   const lib = parseBundle({ files: [{ path: 'Apple Music Library Tracks.json', text: '{not json' }] });
   assert.equal(lib.collections.length, 0);
   assert.match(lib.warnings[0], /^Skipped Apple Music Library Tracks\.json:/);
+});
+
+// ---- Google Play Music (Google Takeout) --------------------------------------------------
+
+const gpmFixture = new URL('./fixtures/google-play-music-takeout.zip', import.meta.url);
+
+test('zips are read straight from disk, skipping audio without decompressing it', async () => {
+  const bundle = await loadBundle({ filename: 'takeout.zip', path: fileURLToPath(gpmFixture) });
+  const paths = bundle.files.map((f) => f.path);
+  assert.ok(paths.includes('Takeout/Google Play Music/Tracks/So What.csv'));
+  assert.ok(!paths.some((p) => /\.(mp3|mega|html)$/.test(p) || p.includes('__MACOSX')));
+  // Same result whether the upload is on disk or in memory.
+  const inMemory = await loadBundle({ filename: 'takeout.zip', buffer: await readFile(gpmFixture) });
+  assert.deepEqual(inMemory.files.map((f) => f.path), paths);
+});
+
+test('a multi-part Apple export also loads from disk', async () => {
+  const lib = await parseExport({
+    files: [
+      { filename: 'Part 1 of 2.zip', path: fileURLToPath(applePart1) },
+      { filename: 'Part 2 of 2.zip', path: fileURLToPath(applePart2) },
+    ],
+  });
+  assert.equal(lib.format, 'apple-music');
+  assert.equal(lib.collections[0].tracks.length, 3);
+});
+
+test('Google Play Music Takeout: library → favourites, playlists in Playlist Index order', async () => {
+  const lib = await parseExport({ filename: 'takeout.zip', buffer: await readFile(gpmFixture) });
+  assert.equal(lib.format, 'google-play-music');
+  const [songs, roadTrip, thumbsUp, ...rest] = lib.collections;
+  assert.equal(rest.length, 0, 'deleted and empty playlists, and radio stations, are not collections');
+
+  assert.equal(songs.kind, 'favorites');
+  assert.deepEqual(
+    songs.tracks.map((t) => t.title),
+    ["I'm Down", 'Kodachrome', 'So What'],
+    'HTML entities decoded; removed, thumbs-down and duplicate tracks left out',
+  );
+  const soWhat = songs.tracks[2];
+  assert.equal(soWhat.album, 'Kind of Blue');
+  assert.deepEqual(soWhat.artists, ['Miles Davis']);
+  assert.equal(soWhat.durationMs, 200000);
+  assert.equal(soWhat.needsLookup, false);
+
+  assert.equal(roadTrip.name, 'Road Trip');
+  assert.equal(roadTrip.description, 'Car songs & more');
+  assert.deepEqual(roadTrip.tracks.map((t) => t.title), ['So What', 'Kodachrome', 'Nookie'], 'index order; removed entry dropped');
+  assert.equal(roadTrip.tracks[0].key, soWhat.key, 'same song → same dedupe key across collections');
+
+  assert.equal(thumbsUp.name, 'Thumbs Up', 'auto playlist without Metadata.csv is named after its folder');
+  assert.deepEqual(thumbsUp.tracks.map((t) => t.title), ['Kodachrome']);
+
+  assert.deepEqual(lib.warnings, [
+    '1 thumbs-down song was left out of your favourites.',
+    'Skipped 2 playlist entries marked as removed.',
+    'Skipped deleted playlists: "Old Stuff".',
+    'Skipped empty playlists: "Spring".',
+  ]);
+});
+
+test('Google Play Music Takeout uploaded twice is not duplicated', async () => {
+  const buffer = await readFile(gpmFixture);
+  const lib = await parseExport({ files: [{ filename: 'a.zip', buffer }, { filename: 'b.zip', buffer }] });
+  assert.deepEqual(lib.collections.map((c) => [c.name, c.tracks.length]), [
+    ['Library songs', 3],
+    ['Road Trip', 3],
+    ['Thumbs Up', 1],
+  ]);
+  assert.equal(lib.warnings[1], 'Skipped 2 playlist entries marked as removed.');
+});
+
+test('decodeHtmlEntities handles numeric, hex and named references', () => {
+  assert.equal(decodeHtmlEntities('I&#39;m &amp; you&#x2019;re &quot;ok&quot; &bogus;'), 'I\'m & you’re "ok" &bogus;');
+  assert.equal(decodeHtmlEntities(null), null);
 });
