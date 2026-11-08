@@ -151,7 +151,10 @@ records from every import into one table you can search and filter by source and
 (`GET /api/missing`, or `GET /api/missing.csv` for all of it as one CSV). A song missing from
 several playlists or exports is one row listing each place; songs match on title + artist,
 ignoring case, accents and punctuation. A song that another import did add to TIDAL (same
-source track) is left out.
+source track) is left out. When at least 3 songs of one album (same artist + album name) are
+missing and none of that album's tracks reached TIDAL from any import, the album is shown as
+one **whole record** row (tracks listed on demand); the other missing tracks follow it. The
+CSV marks those songs with `whole_record` = `yes`.
 
 ### About the YouTube Music export
 

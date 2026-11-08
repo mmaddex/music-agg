@@ -158,10 +158,10 @@ test('full flow: login → upload → match workflow → review → load workflo
   assert.match(csv.headers.get('content-disposition'), /filename="export-not-imported\.csv"/);
   const bytes = Buffer.from(await csv.arrayBuffer());
   assert.equal(bytes.toString('utf8'), '\ufeffcollection,title,artist,album,reason,detail,source_url,audio_file\r\n', 'UTF-8 BOM so Excel opens it correctly');
-  assert.deepEqual((await (await call('/api/missing')).json()).songs, [], 'nothing is missing once Retry added everything');
+  assert.deepEqual(await (await call('/api/missing')).json(), { records: [], tracks: [] }, 'nothing is missing once Retry added everything');
   const allCsv = await call('/api/missing.csv');
   assert.match(allCsv.headers.get('content-disposition'), /filename="missing-songs\.csv"/);
-  assert.equal(Buffer.from(await allCsv.arrayBuffer()).toString('utf8'), '\ufefftitle,artist,album,source,export,collection,reason,detail,source_url,audio_file\r\n');
+  assert.equal(Buffer.from(await allCsv.arrayBuffer()).toString('utf8'), '\ufefftitle,artist,album,whole_record,source,export,collection,reason,detail,source_url,audio_file\r\n');
 
   // A multi-part export (Apple's "Part 1 of 2" + "Part 2 of 2") is uploaded in one request.
   const multi = new FormData();

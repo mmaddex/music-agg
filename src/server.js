@@ -367,16 +367,18 @@ export function createApp({ pool, dispatcher, fetchImpl = fetch }) {
 
   // Songs still missing from TIDAL across all of this account's imports (see missingAcrossImports).
   app.get('/api/missing', requireLogin, wrap(async (req, res) => {
-    res.json({ songs: await repo.missingAcrossImports(pool, req.account.id) });
+    res.json(await repo.missingAcrossImports(pool, req.account.id));
   }));
 
   app.get('/api/missing.csv', requireLogin, wrap(async (req, res) => {
-    const songs = await repo.missingAcrossImports(pool, req.account.id);
-    const header = ['title', 'artist', 'album', 'source', 'export', 'collection', 'reason', 'detail', 'source_url', 'audio_file'];
+    const { records, tracks } = await repo.missingAcrossImports(pool, req.account.id);
+    // whole_record: yes when the song's album is missing whole (listed first, album by album).
+    const header = ['title', 'artist', 'album', 'whole_record', 'source', 'export', 'collection', 'reason', 'detail', 'source_url', 'audio_file'];
     const lines = [header.join(',')];
-    for (const s of songs) {
+    const songs = [...records.flatMap((r) => r.tracks.map((s) => [s, 'yes'])), ...tracks.map((s) => [s, 'no'])];
+    for (const [s, whole] of songs) {
       for (const p of s.places) {
-        lines.push([s.title, s.artist, s.album, p.formatLabel, p.filename, p.collection, p.reason, p.detail, p.url, p.audioFile].map(csvCell).join(','));
+        lines.push([s.title, s.artist, s.album, whole, p.formatLabel, p.filename, p.collection, p.reason, p.detail, p.url, p.audioFile].map(csvCell).join(','));
       }
     }
     res.set('content-type', 'text/csv; charset=utf-8');

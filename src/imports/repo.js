@@ -337,13 +337,53 @@ export async function deleteOldImports(pool, days = 30) {
 
 // ---- missing songs across imports ---------------------------------------------------------
 
+/** Albums need this many missing tracks (and none on TIDAL) to be shown as a whole record. */
+export const MIN_RECORD_TRACKS = 3;
+
+const albumKey = (artist, album) => `${normalize(artist)}|${normalize(album)}`;
+
+/**
+ * Split missing songs into whole records and the rest. A record is an album (same artist +
+ * album name) with at least MIN_RECORD_TRACKS missing songs, none of whose tracks from any
+ * import reached TIDAL (`onTidal`: album keys with a track on TIDAL).
+ * @returns {{ records: [{ artist, album, reasons, tracks }], tracks: songs }}
+ */
+export function groupMissingRecords(songs, onTidal = new Set(), minTracks = MIN_RECORD_TRACKS) {
+  const albums = new Map();
+  for (const s of songs) {
+    if (!s.album || !s.artist) continue;
+    const k = albumKey(s.artist, s.album);
+    if (!albums.has(k)) albums.set(k, []);
+    albums.get(k).push(s);
+  }
+  const records = [];
+  const inRecord = new Set();
+  for (const [k, list] of albums) {
+    if (list.length < minTracks || onTidal.has(k)) continue;
+    for (const s of list) inRecord.add(s);
+    records.push({
+      artist: list[0].artist,
+      album: list[0].album,
+      reasons: [...new Set(list.flatMap((s) => s.reasons))],
+      tracks: [...list].sort((a, b) => cmpText(a.title, b.title)),
+    });
+  }
+  records.sort((a, b) => cmpText(a.artist, b.artist) || cmpText(a.album, b.album));
+  return { records, tracks: songs.filter((s) => !inRecord.has(s)) };
+}
+
+function cmpText(a, b) {
+  return String(a || '\uffff').localeCompare(String(b || '\uffff'), undefined, { sensitivity: 'base' });
+}
+
 /**
  * Every song in any of the account's imports that did not reach TIDAL, merged into one list.
  * The same song (same title + artist, or the same source id) missing from several playlists or
- * several exports is one row that lists each place it is missing from. A song that a later (or
- * any other) import did add to TIDAL is left out: it is no longer missing.
- * @returns [{ title, artist, album, reasons, places: [{ importId, filename, formatLabel,
- *            createdAt, collection, reason, detail, url, audioFile }] }], sorted by artist, title
+ * several exports is one entry that lists each place it is missing from. A song that a later (or
+ * any other) import did add to TIDAL is left out: it is no longer missing. Albums missing whole
+ * are returned as records (see groupMissingRecords), the remaining songs as tracks.
+ * @returns {{ records, tracks }} where a song is { title, artist, album, reasons, places: [{
+ *          importId, filename, formatLabel, createdAt, collection, reason, detail, url, audioFile }] }
  */
 export async function missingAcrossImports(db, accountId) {
   const { rows: imports } = await db.query(
@@ -351,7 +391,7 @@ export async function missingAcrossImports(db, accountId) {
        FROM imports WHERE account_id = $1 AND stage = 'load' ORDER BY created_at DESC`,
     [accountId],
   );
-  if (!imports.length) return [];
+  if (!imports.length) return { records: [], tracks: [] };
   const { rows: targets } = await db.query(
     'SELECT import_id, name, status, items, unimported FROM import_targets WHERE import_id = ANY($1::uuid[]) ORDER BY position',
     [imports.map((i) => i.id)],
@@ -396,7 +436,16 @@ export async function missingAcrossImports(db, accountId) {
     for (const u of notImportableRecord({ library: { notImportable: imp.not_importable || [] } }, its)) add(imp, AUDIO_FILES_COLLECTION, u);
   }
   const out = [...songs.values()];
-  const cmp = (a, b) => String(a || '￿').localeCompare(String(b || '￿'), undefined, { sensitivity: 'base' });
-  out.sort((a, b) => cmp(a.artist, b.artist) || cmp(a.title, b.title));
-  return out;
+  out.sort((a, b) => cmpText(a.artist, b.artist) || cmpText(a.title, b.title));
+
+  // Albums with a track on TIDAL are not missing whole.
+  const { rows: onTidalRows } = written.size
+    ? await db.query(
+        `SELECT track->>'album' AS album, track->>'artistCredit' AS credit, track->'artists' AS artists
+           FROM import_tracks WHERE import_id = ANY($1::uuid[]) AND key = ANY($2::text[]) AND track->>'album' IS NOT NULL`,
+        [imports.map((i) => i.id), [...written]],
+      )
+    : { rows: [] };
+  const onTidal = new Set(onTidalRows.map((r) => albumKey(r.credit || (r.artists || []).join(', '), r.album)));
+  return groupMissingRecords(out, onTidal);
 }

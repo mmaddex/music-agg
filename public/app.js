@@ -467,8 +467,9 @@ async function openMissing() {
   show('missing');
   $('#missing-rows').replaceChildren(h('tr', {}, h('td', { colspan: '3', class: 'muted' }, 'Loading…')));
   try {
-    const { songs } = await api('/api/missing');
-    state.missing = songs;
+    state.missing = await api('/api/missing');
+    const { records, tracks } = state.missing;
+    const songs = [...records.flatMap((r) => r.tracks), ...tracks];
     const fill = (sel, values, label) => {
       const current = sel.value;
       sel.replaceChildren(sel.options[0], ...values.map((v) => h('option', { value: v }, label(v))));
@@ -476,13 +477,11 @@ async function openMissing() {
     };
     fill($('#missing-source'), [...new Set(songs.flatMap((s) => s.places.map((p) => p.formatLabel)))].sort(), (v) => v);
     fill($('#missing-reason'), [...new Set(songs.flatMap((s) => s.reasons))].sort((a, b) => reasonLabel(a).localeCompare(reasonLabel(b))), reasonLabel);
-    const byReason = {};
-    for (const s of songs) for (const r of s.reasons) byReason[r] = (byReason[r] || 0) + 1;
+    const plural = (n, one, many) => (n === 1 ? one : many);
     $('#missing-stats').replaceChildren(
-      h('div', { class: 'stat' }, h('b', {}, songs.length), songs.length === 1 ? 'song missing' : 'songs missing'),
-      ...Object.entries(byReason)
-        .sort((a, b) => b[1] - a[1])
-        .map(([r, n]) => h('div', { class: 'stat' }, h('b', {}, n), reasonLabel(r))),
+      h('div', { class: 'stat' }, h('b', {}, songs.length), plural(songs.length, 'song missing', 'songs missing')),
+      h('div', { class: 'stat' }, h('b', {}, records.length), plural(records.length, 'whole record', 'whole records')),
+      h('div', { class: 'stat' }, h('b', {}, tracks.length), plural(tracks.length, 'other track', 'other tracks')),
     );
     renderMissing();
   } catch (err) {
@@ -491,55 +490,109 @@ async function openMissing() {
   }
 }
 
+const statusClass = (r) => `status ${r === 'own_audio_file' || r === 'excluded_by_you' ? 'review' : 'not_found'}`;
+
+/** Reason badges for some places, each with its first detail line unless `brief`. */
+function reasonCell(places, brief = false) {
+  return h(
+    'td',
+    {},
+    ...[...new Set(places.map((p) => p.reason))].map((r) => {
+      const detail = places.find((p) => p.reason === r && p.detail)?.detail;
+      return h('div', {}, h('span', { class: statusClass(r), title: detail || '' }, reasonLabel(r)), detail && !brief ? h('div', { class: 'sub' }, detail) : null);
+    }),
+  );
+}
+
+function recordRow(r, songs) {
+  // Each playlist + export the record's songs are missing from, with how many of them.
+  const where = new Map();
+  for (const s of songs) {
+    for (const p of s.places) {
+      const k = `${p.importId}\n${p.collection}`;
+      const w = where.get(k) || { p, keys: new Set() };
+      w.keys.add(s);
+      where.set(k, w);
+    }
+  }
+  const places = songs.flatMap((s) => s.places);
+  return h(
+    'tr',
+    { class: 'record' },
+    h(
+      'td',
+      {},
+      h('div', { class: 'src-title' }, r.album),
+      h('div', { class: 'sub' }, `${r.artist} · whole record, ${songs.length} track${songs.length === 1 ? '' : 's'}`),
+      h('details', { class: 'record-tracks' }, h('summary', {}, 'Tracks'), h('ol', {}, ...songs.map((s) => h('li', {}, s.title || 'Untitled track')))),
+    ),
+    h(
+      'td',
+      {},
+      ...[...where.values()].map(({ p, keys }) =>
+        h('div', { class: 'place' }, p.collection, h('span', { class: 'sub' }, ` · ${p.formatLabel}, ${new Date(p.createdAt).toLocaleDateString()}${keys.size < songs.length ? ` (${keys.size} of ${songs.length} tracks)` : ''}`)),
+      ),
+    ),
+    reasonCell(places, true),
+  );
+}
+
+function trackRow(s, places) {
+  const link = places.find((p) => p.url)?.url;
+  const title = s.title || 'Untitled track';
+  return h(
+    'tr',
+    {},
+    h(
+      'td',
+      {},
+      h('div', { class: 'src-title' }, link ? h('a', { href: link, target: '_blank', rel: 'noopener' }, title) : title),
+      h('div', { class: 'sub' }, [s.artist, s.album].filter(Boolean).join(' · ')),
+    ),
+    h(
+      'td',
+      {},
+      ...places.map((p) => h('div', { class: 'place' }, p.collection, h('span', { class: 'sub' }, ` · ${p.formatLabel}, ${new Date(p.createdAt).toLocaleDateString()}`))),
+    ),
+    reasonCell(places),
+  );
+}
+
 function renderMissing() {
-  const songs = state.missing || [];
+  const { records = [], tracks = [] } = state.missing || {};
   const q = $('#missing-search').value.trim().toLowerCase();
   const source = $('#missing-source').value;
   const reason = $('#missing-reason').value;
-  const shown = songs.filter((s) => {
-    const places = s.places.filter((p) => (!source || p.formatLabel === source) && (!reason || p.reason === reason));
-    if (!places.length) return false;
-    if (!q) return true;
-    return [s.title, s.artist, s.album, ...places.map((p) => p.collection)].some((v) => v && v.toLowerCase().includes(q));
-  });
+  const hit = (...values) => !q || values.some((v) => v && v.toLowerCase().includes(q));
+  const placesOf = (s) => s.places.filter((p) => (!source || p.formatLabel === source) && (!reason || p.reason === reason));
+  const withPlaces = (s) => ({ ...s, places: placesOf(s) });
+
+  const shownRecords = [];
+  for (const r of records) {
+    const songs = r.tracks.map(withPlaces).filter((s) => s.places.length);
+    if (!songs.length) continue;
+    const albumHit = hit(r.artist, r.album);
+    const matching = albumHit ? songs : songs.filter((s) => hit(s.title, ...s.places.map((p) => p.collection)));
+    if (matching.length) shownRecords.push([r, matching]);
+  }
+  const shownTracks = tracks.map(withPlaces).filter((s) => s.places.length && hit(s.title, s.artist, s.album, ...s.places.map((p) => p.collection)));
+
   const LIMIT = 500;
-  const rows = shown.slice(0, LIMIT).map((s) => {
-    const places = s.places.filter((p) => (!source || p.formatLabel === source) && (!reason || p.reason === reason));
-    const link = places.find((p) => p.url)?.url;
-    const title = s.title || 'Untitled track';
-    return h(
-      'tr',
-      {},
-      h(
-        'td',
-        {},
-        h('div', { class: 'src-title' }, link ? h('a', { href: link, target: '_blank', rel: 'noopener' }, title) : title),
-        h('div', { class: 'sub' }, [s.artist, s.album].filter(Boolean).join(' · ')),
-      ),
-      h(
-        'td',
-        {},
-        ...places.map((p) =>
-          h('div', { class: 'place' }, p.collection, h('span', { class: 'sub' }, ` · ${p.formatLabel}, ${new Date(p.createdAt).toLocaleDateString()}`)),
-        ),
-      ),
-      h(
-        'td',
-        {},
-        ...[...new Set(places.map((p) => p.reason))].map((r) => {
-          const detail = places.find((p) => p.reason === r && p.detail)?.detail;
-          return h('div', {}, h('span', { class: `status ${r === 'own_audio_file' || r === 'excluded_by_you' ? 'review' : 'not_found'}`, title: detail || '' }, reasonLabel(r)), detail ? h('div', { class: 'sub' }, detail) : null);
-        }),
-      ),
-    );
-  });
+  const rows = shownRecords.slice(0, LIMIT).map(([r, songs]) => recordRow(r, songs));
+  const room = LIMIT - rows.length;
+  if (shownTracks.length && room > 0) {
+    if (rows.length) rows.push(h('tr', { class: 'group' }, h('th', { colspan: '3' }, `Other missing tracks (${shownTracks.length})`)));
+    rows.push(...shownTracks.slice(0, room).map((s) => trackRow(s, s.places)));
+  }
+  const total = records.length + tracks.length;
   $('#missing-rows').replaceChildren(
     ...(rows.length
       ? rows
-      : [h('tr', {}, h('td', { colspan: '3', class: 'muted' }, songs.length ? 'No songs match these filters.' : 'Nothing is missing — every imported song is on TIDAL.'))]),
+      : [h('tr', {}, h('td', { colspan: '3', class: 'muted' }, total ? 'Nothing matches these filters.' : 'Nothing is missing — every imported song is on TIDAL.'))]),
   );
-  $('#missing-count').textContent =
-    shown.length > LIMIT ? `Showing the first ${LIMIT} of ${shown.length} songs — narrow the search or download the CSV` : `${shown.length} of ${songs.length} songs`;
+  const shown = shownRecords.length + shownTracks.length;
+  const what = `${shownRecords.length} record${shownRecords.length === 1 ? '' : 's'} and ${shownTracks.length} other track${shownTracks.length === 1 ? '' : 's'}`;
+  $('#missing-count').textContent = shown > LIMIT ? `Showing the first ${LIMIT} of ${what} — narrow the search or download the CSV` : what;
 }
 
 // ---- wiring ---------------------------------------------------------------------

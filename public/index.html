@@ -117,7 +117,8 @@
       <section id="step-missing" class="card" hidden>
         <h2>Songs missing from TIDAL</h2>
         <p class="muted small">
-          Every song from your imports that didn't make it to TIDAL, merged across exports. A song that another import
+          Every song from your imports that didn't make it to TIDAL, merged across exports. Albums where none of your
+          tracks made it are listed as whole records first, then the other missing tracks. A song that another import
           did add is left out. Imports are kept for 30 days.
         </p>
         <div id="missing-stats" class="stats"></div>
@@ -129,7 +130,7 @@
         <div class="table-wrap">
           <table class="track-table missing-table">
             <thead>
-              <tr><th>Song</th><th>Missing from</th><th>Reason</th></tr>
+              <tr><th>Record / song</th><th>Missing from</th><th>Reason</th></tr>
             </thead>
             <tbody id="missing-rows"></tbody>
           </table>
