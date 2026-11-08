@@ -94,13 +94,20 @@ async function logout() {
 
 // ---- upload ---------------------------------------------------------------------
 
-async function uploadFile(file) {
-  if (!file) return;
+// Shown for a source track we have no title for (only an id from the export).
+function sourceLabel(source) {
+  const names = { youtube: 'YouTube video', 'apple-music': 'Apple Music song', 'apple-library': 'Apple Music library track' };
+  return `${names[source?.type] || 'Track'} ${source?.id || ''}`.trim();
+}
+
+async function uploadFiles(fileList) {
+  const files = [...(fileList || [])];
+  if (!files.length) return;
   flash('');
   show('progress');
-  setProgress('Reading your export…', `${file.name}`, 0, 0);
+  setProgress('Reading your export…', files.length === 1 ? files[0].name : `${files.length} files`, 0, 0);
   const form = new FormData();
-  form.append('file', file);
+  for (const file of files) form.append('file', file);
   try {
     openSelect(await api('/api/uploads', { method: 'POST', body: form }));
   } catch (err) {
@@ -142,7 +149,7 @@ function renderSelect() {
             'td',
             {},
             h('input', { type: 'text', value: state.names[c.id], maxlength: '250', oninput: (e) => (state.names[c.id] = e.target.value) }),
-            c.needsLookupCount ? h('div', { class: 'sub' }, `${c.needsLookupCount} of ${c.trackCount} only have a YouTube video id; titles are looked up on YouTube first`) : null,
+            c.needsLookupCount ? h('div', { class: 'sub' }, `${c.needsLookupCount} of ${c.trackCount} only have a source id; titles are looked up first`) : null,
           );
     return h(
       'tr',
@@ -330,7 +337,7 @@ function renderTracks(details, c) {
     select.value = chosenId(item.key) || '';
     const src = t.title
       ? [h('div', { class: 'src-title' }, t.title), h('div', { class: 'sub' }, [t.artistCredit, t.album].filter(Boolean).join(' · '))]
-      : [h('div', { class: 'src-title' }, `YouTube video ${t.source?.id || ''}`)];
+      : [h('div', { class: 'src-title' }, sourceLabel(t.source))];
     if (t.videoTitle) src.push(h('div', { class: 'sub' }, `from video “${t.videoTitle}”`));
     rows.push(
       h(
@@ -432,7 +439,7 @@ function showDone(view) {
 function wire() {
   const input = $('#file');
   const zone = $('#dropzone');
-  input.addEventListener('change', () => uploadFile(input.files[0]));
+  input.addEventListener('change', () => uploadFiles(input.files));
   zone.addEventListener('dragover', (e) => {
     e.preventDefault();
     zone.classList.add('drag');
@@ -441,7 +448,7 @@ function wire() {
   zone.addEventListener('drop', (e) => {
     e.preventDefault();
     zone.classList.remove('drag');
-    uploadFile(e.dataTransfer.files[0]);
+    uploadFiles(e.dataTransfer.files);
   });
   $('#btn-match').addEventListener('click', startMatch);
   $('#btn-reupload').addEventListener('click', () => {

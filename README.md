@@ -4,9 +4,10 @@ A web app that imports music-service exports into **TIDAL**. You log in with you
 account and upload an export. Then you review the matches, and the app creates the playlists
 and adds favourites in your TIDAL account.
 
-Today it supports **YouTube Music (Google Takeout)** and **plain CSV files with title/artist
-columns**. The importer is built so Google Play Music, Apple Music and other exports can be
-added as small plug-in adapters (see [Adding an export format](#adding-an-export-format)).
+Today it supports **YouTube Music (Google Takeout)**, **Apple Music (Apple's privacy export)**
+and **plain CSV files with title/artist columns**. Multi-part exports are uploaded together in
+one go (up to 10 files). The importer is built so other services can be added as small plug-in
+adapters (see [Adding an export format](#adding-an-export-format)).
 
 The slow, network-heavy work runs as **[Render Workflows](https://render.com/docs/workflows)**:
 *matching* (finding each song on TIDAL) and *loading* (writing playlists and favourites).
@@ -144,6 +145,20 @@ public oEmbed endpoint for the video's title and channel; no API key is needed. 
 from video titles must clear a stricter threshold. Private or deleted videos show as
 *not found*.
 
+### About the Apple Music export
+
+Request it at [privacy.apple.com](https://privacy.apple.com) ("Apple Media Services
+information"). Apple sends one or more `Apple Media Services Information Part N of M.zip` files.
+Upload all of them at once. The data is nested zips deep; the app opens them and reads only
+`Apple Music Library Tracks.json` and `Apple Music Library Playlists.json`. Everything else in
+the export (App Store, TV, play history) is ignored.
+
+* **Library songs** become TIDAL favourites, and complete albums among them are saved whole.
+  Songs Apple shows only inside playlists, songs you disliked, and music videos are left out.
+* **Playlists** you made (and *Favorite Songs*) become TIDAL playlists, in order.
+  Subscribed playlists are skipped because the export doesn't list their songs.
+* The export has no ISRCs, so every song is matched by title, artist, album and duration.
+
 ## Running locally
 
 Requires Node 20+ and a Postgres database.
@@ -171,7 +186,7 @@ Tests:
 ```bash
 npm test          # everything; Postgres-backed tests are skipped without TEST_DATABASE_URL
 npm run test:db   # uses TEST_DATABASE_URL (default: local musicagg_test database)
-npm run inspect-export -- path/to/export.zip    # what an export would import, no TIDAL calls
+npm run inspect-export -- path/to/export.zip [part2.zip …]   # what an export would import, no TIDAL calls
 ```
 
 ## Deploying to Render
@@ -212,7 +227,7 @@ tasks can't read the user's TIDAL tokens.
 | `MATCH_CHUNK_SIZE` / `MATCH_PARALLELISM` | workflow | no | Default 100 / 2 |
 | `LOG_LEVEL` | both | no | `debug`, `info` (default), `warn`, `error`, `silent`. See [Logs](#logs) |
 | `DATABASE_SSL` | both | no | Override TLS auto-detection |
-| `MAX_UPLOAD_MB` / `IMPORT_RETENTION_DAYS` | web | no | Default 100 / 30 |
+| `MAX_UPLOAD_MB` / `IMPORT_RETENTION_DAYS` | web | no | Default 100 (per file) / 30 |
 
 `TIDAL_CLIENT_SECRET` is **not** used: TIDAL's user-login (PKCE) flow needs only the client id.
 
@@ -256,8 +271,14 @@ Tokens, OAuth codes, cookies and Authorization headers are never logged.
 1. Create `src/importers/adapters/<name>.js` exporting
    `{ id, label, description, detect(bundle), parse(bundle) }`:
    * `bundle.files` is a list of `{ path, size, text }` covering every CSV/TSV/TXT/JSON/XML/M3U
-     file in the upload, whether that was a zip or a single file. macOS junk is already removed
+     file in the upload, across all uploaded files, whether they were zips or single files.
+     Zips inside zips are opened too (up to 3 levels), and their files' paths are prefixed with
+     the nested archive's path (`outer/inner.zip/dir/file.json`). macOS junk is already removed
      and UTF-8/UTF-16 is already decoded.
+   * `text` is decoded each time it is read, so read it once per pass. In `detect`, use
+     `fileHead(file)` from `bundle.js` to sniff headers without decoding a large file.
+   * Files over 100 MB are skipped rather than failing the upload; they're listed in
+     `bundle.skipped`.
    * `detect` returns a confidence from 0 to 1. The highest score wins, and the generic CSV
      adapter scores 0.5.
    * `parse` returns `{ collections, warnings }` built with `makeCollection` / `makeTrack` from
@@ -268,4 +289,5 @@ Tokens, OAuth codes, cookies and Authorization headers are never logged.
 
 To accept a new container type (for example `.tar.gz`), add a loader to `LOADERS` in
 `src/importers/bundle.js`. Zip uploads are read with streaming size limits, so declared sizes
-in a malicious archive are never trusted.
+in a malicious archive are never trusted. Entry, file and byte limits (`LIMITS`) apply to the
+whole upload, nested archives included.

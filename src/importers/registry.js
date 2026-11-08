@@ -1,14 +1,15 @@
 // Export-format registry.
 //
 // An adapter is { id, label, description, detect(bundle) -> 0..1, parse(bundle) -> { collections, warnings } }.
-// To support Apple Music, Google Play Music, etc.: write an adapter in ./adapters and
-// add it to ADAPTERS. Nothing else in the app needs to change.
+// To support another service: write an adapter in ./adapters and add it to ADAPTERS.
+// Nothing else in the app needs to change.
 
-import { loadBundle } from './bundle.js';
+import { loadBundles } from './bundle.js';
+import { appleMusic } from './adapters/appleMusic.js';
 import { youtubeMusic } from './adapters/youtubeMusic.js';
 import { genericCsv } from './adapters/genericCsv.js';
 
-export const ADAPTERS = [youtubeMusic, genericCsv];
+export const ADAPTERS = [youtubeMusic, appleMusic, genericCsv];
 
 export class UnknownFormatError extends Error {}
 
@@ -38,11 +39,14 @@ export function parseBundle(bundle, { formatId } = {}) {
     );
   }
   const { collections, warnings = [] } = adapter.parse(bundle);
-  return { format: adapter.id, formatLabel: adapter.label, collections, warnings };
+  return { format: adapter.id, formatLabel: adapter.label, collections, warnings, skippedFiles: bundle.skipped || [] };
 }
 
-/** Upload → Library in one step. */
-export async function parseExport({ filename, buffer, formatId }) {
-  const bundle = await loadBundle({ filename, buffer });
+/**
+ * Upload → Library in one step. Pass `files: [{ filename, buffer }]` for a multi-file export
+ * (e.g. Apple's "Part 1 of 2" / "Part 2 of 2"), or a single `filename` + `buffer`.
+ */
+export async function parseExport({ files, filename, buffer, formatId }) {
+  const bundle = await loadBundles(files ?? [{ filename, buffer }]);
   return parseBundle(bundle, { formatId });
 }

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
-import { loadBundle, BundleError, decodeText } from '../src/importers/bundle.js';
+import { loadBundle, loadBundles, BundleError, LIMITS, decodeText, fileHead } from '../src/importers/bundle.js';
 import { parseBundle, parseExport, UnknownFormatError } from '../src/importers/registry.js';
 import { summarizeLibrary } from '../src/importers/model.js';
 
@@ -79,4 +79,127 @@ test('unknown content is rejected with a helpful error', async () => {
 test('UTF-16 text (iTunes-style) is decoded', () => {
   const buf = Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from('Name\tArtist\n', 'utf16le')]);
   assert.equal(decodeText(buf), 'Name\tArtist\n');
+});
+
+// ---- Apple Music (Apple privacy export) -------------------------------------------------
+
+const applePart1 = new URL('./fixtures/apple-part-1.zip', import.meta.url);
+const applePart2 = new URL('./fixtures/apple-part-2.zip', import.meta.url);
+const appleUploads = async () => [
+  { filename: 'Apple Media Services Information Part 1 of 2.zip', buffer: await readFile(applePart1) },
+  { filename: 'Apple Media Services Information Part 2 of 2.zip', buffer: await readFile(applePart2) },
+];
+
+test('nested zips are opened and several uploads merge into one bundle', async () => {
+  const bundle = await loadBundles(await appleUploads());
+  const paths = bundle.files.map((f) => f.path);
+  assert.ok(
+    paths.includes(
+      'Apple Media Services Information Part 1 of 2/Apple_Media_Services.zip/Apple_Media_Services/Apple Music Activity/Apple Music Library Tracks.json.zip/Apple Music Library Tracks.json',
+    ),
+    'three levels deep, prefixed with each archive path',
+  );
+  assert.ok(paths.includes('Game Center/Game Center Data.json'), 'second upload is included');
+  assert.ok(!paths.some((p) => p.endsWith('.zip')), 'archives themselves are not bundle files');
+  assert.ok(!paths.some((p) => p.includes('__MACOSX')));
+  assert.deepEqual(bundle.skipped, []);
+  assert.equal(bundle.name, 'Apple Media Services Information Part 1 of 2.zip, Apple Media Services Information Part 2 of 2.zip');
+});
+
+test('files over the size limit are skipped, not fatal', async () => {
+  const saved = LIMITS.maxFileBytes;
+  LIMITS.maxFileBytes = 20_000; // the fixture's play-activity CSV is ~56 KB
+  try {
+    const lib = await parseExport({ files: await appleUploads() });
+    assert.equal(lib.format, 'apple-music');
+    assert.deepEqual(
+      lib.skippedFiles.map((s) => [s.path.split('/').pop(), s.reason]),
+      [['Apple Music Play Activity.csv', 'too large']],
+    );
+    assert.equal(lib.collections[0].tracks.length, 3, 'the music data still loads');
+  } finally {
+    LIMITS.maxFileBytes = saved;
+  }
+});
+
+test('bundle text is decoded lazily and fileHead reads only the start', async () => {
+  const bundle = await loadBundle({ filename: 'x.csv', buffer: Buffer.from(`a,b\n${'1,2\n'.repeat(5000)}`) });
+  const [file] = bundle.files;
+  assert.equal(Object.getOwnPropertyDescriptor(file, 'text').get !== undefined, true);
+  assert.ok(fileHead(file).length < file.text.length);
+  assert.ok(fileHead(file).startsWith('a,b\n1,2'));
+  assert.equal(fileHead({ path: 'y.csv', text: 'h\n1\n' }), 'h\n1\n', 'hand-built bundles work too');
+});
+
+test('Apple Music export: library songs become favourites, playlists keep their order', async () => {
+  const lib = await parseExport({ files: await appleUploads() });
+  assert.equal(lib.format, 'apple-music');
+  const [songs, favoriteSongs, roadTrip, ...rest] = lib.collections;
+  assert.equal(rest.length, 0, 'subscribed, empty and folder containers are not collections');
+
+  assert.equal(songs.kind, 'favorites');
+  assert.equal(songs.id, 'library-songs');
+  assert.deepEqual(
+    songs.tracks.map((t) => t.title),
+    ['So What', 'Home Recording', 'Pott County Call Return'],
+    'playlist-only, disliked, music-video and duplicate rows are left out',
+  );
+  const [soWhat, home] = songs.tracks;
+  assert.deepEqual(soWhat.source, { type: 'apple-music', id: '1001', url: 'https://music.apple.com/song/1001' });
+  assert.equal(soWhat.album, 'Kind of Blue');
+  assert.equal(soWhat.durationMs, 200000);
+  assert.equal(soWhat.addedAt, '2021-09-05T23:12:49Z');
+  assert.equal(soWhat.needsLookup, false);
+  assert.deepEqual(home.source, { type: 'apple-library', id: '5', url: null }, 'no catalog id → library id');
+
+  assert.equal(favoriteSongs.kind, 'playlist');
+  assert.equal(favoriteSongs.name, 'Favorite Songs');
+  assert.equal(favoriteSongs.suggested, true);
+  assert.deepEqual(favoriteSongs.tracks.map((t) => t.title), ['Pott County Call Return', 'So What']);
+
+  assert.equal(roadTrip.id, 'playlist-300');
+  assert.equal(roadTrip.description, 'Car songs');
+  assert.equal(roadTrip.createdAt, '2025-01-17T17:25:05Z');
+  assert.deepEqual(
+    roadTrip.tracks.map((t) => t.title),
+    ['Blue in Green', 'So What', 'Nookie'],
+    'playlist-only and disliked songs still count in playlists; the video and unknown id are dropped',
+  );
+  assert.equal(roadTrip.tracks[1].key, soWhat.key, 'same song → same dedupe key across collections');
+
+  assert.deepEqual(lib.warnings, [
+    '1 music video was skipped (only songs are imported).',
+    "1 subscribed playlist was skipped: Apple's export doesn't list their songs.",
+    'Skipped empty playlists: "Nothing Yet".',
+    'Skipped 1 playlist entry pointing at songs missing from the library export.',
+  ]);
+});
+
+test('Apple Music export: uploading the same part twice does not duplicate anything', async () => {
+  const [part1] = await appleUploads();
+  const lib = await parseExport({ files: [part1, { ...part1, filename: 'copy.zip' }] });
+  assert.deepEqual(lib.collections.map((c) => [c.name, c.tracks.length]), [
+    ['Library songs', 3],
+    ['Favorite Songs', 2],
+    ['Road Trip', 3],
+  ]);
+});
+
+test('Apple Music adapter tolerates key spelling drift and wins over generic CSV', () => {
+  const tracks = [{ 'track identifier': 7, title: 'Song', ARTIST: 'Artist', 'Apple Music Track Identifier': 77 }];
+  const lib = parseBundle({
+    files: [
+      { path: 'x/Apple Music Library Tracks.json', text: JSON.stringify(tracks) },
+      { path: 'x/Apple Music - Track Play History.csv', text: 'Track Name,Artist Name\nSong,Artist\n' },
+    ],
+  });
+  assert.equal(lib.format, 'apple-music');
+  assert.equal(lib.collections[0].tracks[0].artistCredit, 'Artist');
+  assert.equal(lib.collections[0].tracks[0].source.id, '77');
+});
+
+test('Apple Music adapter reports unreadable JSON instead of failing', () => {
+  const lib = parseBundle({ files: [{ path: 'Apple Music Library Tracks.json', text: '{not json' }] });
+  assert.equal(lib.collections.length, 0);
+  assert.match(lib.warnings[0], /^Skipped Apple Music Library Tracks\.json:/);
 });

@@ -158,4 +158,23 @@ test('full flow: login → upload → match workflow → review → load workflo
   assert.match(csv.headers.get('content-disposition'), /filename="export-not-imported\.csv"/);
   const bytes = Buffer.from(await csv.arrayBuffer());
   assert.equal(bytes.toString('utf8'), '\ufeffcollection,title,artist,album,reason,detail,source_url\r\n', 'UTF-8 BOM so Excel opens it correctly');
+
+  // A multi-part export (Apple's "Part 1 of 2" + "Part 2 of 2") is uploaded in one request.
+  const multi = new FormData();
+  multi.append('file', new Blob([await readFile(new URL('./fixtures/apple-part-1.zip', import.meta.url))]), 'Apple Media Services Information Part 1 of 2.zip');
+  multi.append('file', new Blob([await readFile(new URL('./fixtures/apple-part-2.zip', import.meta.url))]), 'Apple Media Services Information Part 2 of 2.zip');
+  const apple = await (await call('/api/uploads', { method: 'POST', body: multi })).json();
+  assert.equal(apple.status, 'parsed', apple.error);
+  assert.equal(apple.filename, 'Apple Media Services Information Part 1 of 2.zip + 1 more');
+  assert.equal(apple.formatLabel, 'Apple Music (Apple privacy export)');
+  assert.deepEqual(apple.collections.map((c) => [c.name, c.trackCount]), [
+    ['Library songs', 3],
+    ['Favorite Songs', 2],
+    ['Road Trip', 3],
+  ]);
+  const tooMany = new FormData();
+  for (let i = 0; i < 11; i += 1) tooMany.append('file', new Blob(['Title,Artist\nA,B\n']), `${i}.csv`);
+  const rejected = await call('/api/uploads', { method: 'POST', body: tooMany });
+  assert.equal(rejected.status, 413);
+  assert.match((await rejected.json()).error, /at most 10 files/);
 });

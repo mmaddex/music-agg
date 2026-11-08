@@ -161,7 +161,9 @@ export function createApp({ pool, dispatcher, fetchImpl = fetch }) {
   });
   app.use(express.json({ limit: '5mb' }));
 
-  const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: config.maxUploadBytes, files: 1 } });
+  // Several files per upload: multi-part exports such as Apple's "… Part 1 of 2.zip" + "Part 2 of 2.zip".
+  const MAX_UPLOAD_FILES = 10;
+  const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: config.maxUploadBytes, files: MAX_UPLOAD_FILES } });
 
   const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
   // The session store is async: persist before redirecting, or the browser can arrive at the
@@ -282,13 +284,24 @@ export function createApp({ pool, dispatcher, fetchImpl = fetch }) {
     });
   }));
 
-  app.post('/api/uploads', requireLogin, upload.single('file'), wrap(async (req, res) => {
-    if (!req.file) return res.status(400).json({ error: 'No file uploaded.' });
+  app.post('/api/uploads', requireLogin, upload.array('file', MAX_UPLOAD_FILES), wrap(async (req, res) => {
+    const uploads = req.files || [];
+    if (!uploads.length) return res.status(400).json({ error: 'No file uploaded.' });
     let library;
     const startedAt = performance.now();
-    const fileFields = { accountId: req.account.id, filename: req.file.originalname, bytes: req.file.size, requestedFormat: req.body?.format || undefined };
+    const filename = uploads.length === 1 ? uploads[0].originalname : `${uploads[0].originalname} + ${uploads.length - 1} more`;
+    const fileFields = {
+      accountId: req.account.id,
+      filename,
+      files: uploads.length,
+      bytes: uploads.reduce((n, f) => n + f.size, 0),
+      requestedFormat: req.body?.format || undefined,
+    };
     try {
-      library = await parseExport({ filename: req.file.originalname, buffer: req.file.buffer, formatId: req.body?.format || undefined });
+      library = await parseExport({
+        files: uploads.map((f) => ({ filename: f.originalname, buffer: f.buffer })),
+        formatId: req.body?.format || undefined,
+      });
     } catch (err) {
       if (err instanceof BundleError || err instanceof UnknownFormatError) {
         log.warn('import.parse_rejected', { ...fileFields, ms: Math.round(performance.now() - startedAt), err });
@@ -296,7 +309,7 @@ export function createApp({ pool, dispatcher, fetchImpl = fetch }) {
       }
       throw err;
     }
-    const id = await repo.createImport(pool, { accountId: req.account.id, filename: req.file.originalname, library });
+    const id = await repo.createImport(pool, { accountId: req.account.id, filename, library });
     log.info('import.created', {
       ...fileFields,
       importId: id,
@@ -305,6 +318,7 @@ export function createApp({ pool, dispatcher, fetchImpl = fetch }) {
       tracks: library.collections.reduce((n, c) => n + c.tracks.length, 0),
       needsLookup: library.collections.reduce((n, c) => n + c.tracks.filter((t) => t.needsLookup).length, 0),
       warnings: library.warnings?.length || 0,
+      skippedFiles: library.skippedFiles?.length || 0,
       ms: Math.round(performance.now() - startedAt),
     });
     res.json(await importView(pool, await repo.getImport(pool, id)));
@@ -388,7 +402,12 @@ export function createApp({ pool, dispatcher, fetchImpl = fetch }) {
   app.use((err, req, res, next) => {
     if (res.headersSent) return next(err);
     if (err instanceof multer.MulterError) {
-      const msg = err.code === 'LIMIT_FILE_SIZE' ? `File is larger than ${config.maxUploadBytes / 1024 / 1024} MB.` : err.message;
+      const msg =
+        err.code === 'LIMIT_FILE_SIZE'
+          ? `Each file must be ${config.maxUploadBytes / 1024 / 1024} MB or smaller.`
+          : err.code === 'LIMIT_FILE_COUNT' || err.code === 'LIMIT_UNEXPECTED_FILE'
+            ? `Upload at most ${MAX_UPLOAD_FILES} files at once.`
+            : err.message;
       return res.status(413).json({ error: msg });
     }
     if (err instanceof HttpError) {

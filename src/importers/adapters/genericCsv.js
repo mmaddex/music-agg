@@ -9,6 +9,7 @@ import path from 'node:path';
 import { makeCollection, makeTrack } from '../model.js';
 import { findColumn, parseCsv } from '../csv.js';
 import { toIsoDate } from '../../util/text.js';
+import { fileHead } from '../bundle.js';
 
 const COLUMNS = {
   title: ['Title', 'Song Title', 'Track Title', 'Track Name', 'Song', 'Song Name', 'Name', 'Track'],
@@ -23,7 +24,9 @@ function columnsFor(file) {
   if (!/\.(csv|tsv|txt)$/i.test(file.path)) return null;
   let rows;
   try {
-    rows = parseCsv(file.text.split(/\r?\n/).slice(0, 5).join('\n'));
+    const lines = fileHead(file).split(/\r?\n/);
+    if (lines.length > 2) lines.pop(); // the head may end mid-line
+    rows = parseCsv(lines.slice(0, 5).join('\n'));
   } catch {
     return null;
   }

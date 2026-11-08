@@ -2,7 +2,7 @@
   "name": "music-agg",
   "version": "0.1.0",
   "private": true,
-  "description": "Import music library exports (YouTube Music, and more later) into TIDAL.",
+  "description": "Import music library exports (YouTube Music, Apple Music, CSV) into TIDAL.",
   "type": "module",
   "main": "src/server.js",
   "engines": {

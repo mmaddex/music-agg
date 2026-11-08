@@ -22,6 +22,7 @@ import path from 'node:path';
 import { makeCollection, makeTrack } from '../model.js';
 import { findColumn, firstLine, parseCsv } from '../csv.js';
 import { toIsoDate } from '../../util/text.js';
+import { fileHead } from '../bundle.js';
 
 const LIBRARY_HEADER = /^song url,song title,album title,artist names/i;
 const PLAYLIST_META_HEADER = /^playlist id,/i;
@@ -37,12 +38,12 @@ function videoIdFromUrl(url) {
 }
 
 function isLibraryFile(file) {
-  return /\.csv$/i.test(file.path) && LIBRARY_HEADER.test(firstLine(file.text));
+  return /\.csv$/i.test(file.path) && LIBRARY_HEADER.test(firstLine(fileHead(file)));
 }
 
 function isPlaylistFile(file) {
   if (!/\.csv$/i.test(file.path) || !/(^|\/)playlists\//i.test(file.path)) return false;
-  const head = firstLine(file.text);
+  const head = firstLine(fileHead(file));
   return PLAYLIST_META_HEADER.test(head) || /^video id,/i.test(head);
 }
 
